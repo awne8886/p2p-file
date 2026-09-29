@@ -1,0 +1,22 @@
+{
+  "name": "@pizzadrop/server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PizzaDrop signaling server: issues short codes and relays WebRTC signaling. Never sees file data.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "dev": "tsx watch --clear-screen=false src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@pizzadrop/shared": "1.0.0",
+    "ws": "^8.22.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.2",
+    "tsx": "^4.23.15"
+  }
+}

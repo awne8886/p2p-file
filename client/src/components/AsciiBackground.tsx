@@ -1,0 +1,68 @@
+import { useEffect, useRef } from 'react';
+import { AsciiPizzaRenderer } from '../ascii/renderer';
+
+interface Props {
+  /** 0 = idle, 1 = excited (e.g. a file is being dragged over the page). */
+  energy: number;
+}
+
+const reducedMotionQuery = () => window.matchMedia('(prefers-reduced-motion: reduce)');
+
+/**
+ * Full-viewport canvas behind the UI. Pauses when the tab is hidden and
+ * renders a single static frame when the user prefers reduced motion.
+ */
+export function AsciiBackground({ energy }: Props) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const rendererRef = useRef<AsciiPizzaRenderer | null>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const mq = reducedMotionQuery();
+    let renderer: AsciiPizzaRenderer;
+    try {
+      renderer = new AsciiPizzaRenderer(canvas, { reducedMotion: mq.matches });
+    } catch {
+      return; // No 2D canvas: the page is simply black.
+    }
+    rendererRef.current = renderer;
+
+    let pending = 0;
+    const resize = () => {
+      cancelAnimationFrame(pending);
+      pending = requestAnimationFrame(() => {
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        renderer.resize(canvas.clientWidth, canvas.clientHeight, dpr);
+        canvas.dataset.stars = String(renderer.starCount);
+      });
+    };
+    const ro = new ResizeObserver(resize);
+    ro.observe(canvas);
+    resize();
+
+    const onVisibility = () => {
+      if (document.hidden) renderer.stop();
+      else renderer.start();
+    };
+    const onMotionChange = () => renderer.setReducedMotion(mq.matches);
+    document.addEventListener('visibilitychange', onVisibility);
+    mq.addEventListener('change', onMotionChange);
+    if (!document.hidden) renderer.start();
+
+    return () => {
+      cancelAnimationFrame(pending);
+      ro.disconnect();
+      document.removeEventListener('visibilitychange', onVisibility);
+      mq.removeEventListener('change', onMotionChange);
+      renderer.dispose();
+      rendererRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    rendererRef.current?.setEnergy(energy);
+  }, [energy]);
+
+  return <canvas ref={canvasRef} className="ascii-bg" aria-hidden="true" data-testid="ascii-bg" />;
+}

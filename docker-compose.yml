@@ -1,0 +1,41 @@
+# docker compose up -d                      → app on :8080 (put HTTPS in front of it)
+# docker compose --profile turn up -d      → app + a coturn TURN server
+services:
+  pizzadrop:
+    build: .
+    ports:
+      - '8080:8080'
+    env_file:
+      - path: .env
+        required: false
+    restart: unless-stopped
+
+  # Optional TURN relay for receivers behind strict NATs / firewalls.
+  # Set in .env: TURN_SECRET, TURN_EXTERNAL_IP, and on the app side
+  # TURN_URLS=turn:<your-host>:3478?transport=udp,turn:<your-host>:3478?transport=tcp
+  coturn:
+    image: coturn/coturn:4.6
+    profiles: ['turn']
+    network_mode: host
+    restart: unless-stopped
+    command:
+      - -n
+      - --log-file=stdout
+      - --listening-port=3478
+      - --realm=${TURN_REALM:-pizzadrop}
+      - --use-auth-secret
+      - --static-auth-secret=${TURN_SECRET:?set TURN_SECRET in .env}
+      - --external-ip=${TURN_EXTERNAL_IP:?set TURN_EXTERNAL_IP in .env}
+      - --min-port=49160
+      - --max-port=49400
+      - --fingerprint
+      - --no-cli
+      - --no-multicast-peers
+      # Never relay into private networks (prevents SSRF-style abuse of the relay).
+      - --denied-peer-ip=0.0.0.0-0.255.255.255
+      - --denied-peer-ip=10.0.0.0-10.255.255.255
+      - --denied-peer-ip=100.64.0.0-100.127.255.255
+      - --denied-peer-ip=127.0.0.0-127.255.255.255
+      - --denied-peer-ip=169.254.0.0-169.254.255.255
+      - --denied-peer-ip=172.16.0.0-172.31.255.255
+      - --denied-peer-ip=192.168.0.0-192.168.255.255

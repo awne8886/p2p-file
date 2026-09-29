@@ -1,0 +1,45 @@
+{
+  "name": "pizzadrop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Peer-to-peer, browser-to-browser file transfer with short links, QR codes and an animated ASCII pizza.",
+  "license": "MIT",
+  "type": "module",
+  "workspaces": [
+    "shared",
+    "server",
+    "client"
+  ],
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "tsx scripts/dev.ts",
+    "build": "npm run build -w shared && npm run build -w server && npm run build -w client",
+    "start": "node server/dist/index.js",
+    "check": "npm run lint && npm run format:check && npm run typecheck && npm run test",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "npm run typecheck -w shared && npm run typecheck -w server && npm run typecheck -w client && tsc -p tsconfig.tools.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "tsx e2e/run.ts"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^24.0.0",
+    "@types/pngjs": "^6.0.5",
+    "eslint": "^10.11.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.12.0",
+    "jsqr": "^1.4.0",
+    "playwright-core": "^1.63.0",
+    "pngjs": "^7.0.0",
+    "prettier": "^3.9.9",
+    "tsx": "^4.23.15",
+    "typescript": "~6.0.3",
+    "typescript-eslint": "^8.71.0",
+    "vitest": "^5.0.2"
+  }
+}
