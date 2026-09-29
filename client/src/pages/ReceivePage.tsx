@@ -1,8 +1,9 @@
-import { formatBytes, formatDuration, formatSpeed } from '@pizzadrop/shared';
+import { formatBytes, formatDuration, formatSpeed, type FileMeta } from '@pizzadrop/shared';
 import { useEffect, useRef, useState } from 'react';
 import { AsciiProgress } from '../components/AsciiProgress';
 import { useBeforeUnload } from '../hooks/useBeforeUnload';
 import { useSideLayout } from '../hooks/useSideLayout';
+import { BASE_PATH } from '../lib/config';
 import { BLOB_WARN_BYTES } from '../lib/constants';
 import { Receiver, type ReceiveSnapshot } from '../lib/receiver';
 import {
@@ -18,6 +19,8 @@ import {
 interface Props {
   code: string;
   setEnergy(energy: number): void;
+  /** Tells the background a transfer is running (it animates more cheaply then). */
+  setTransferring(transferring: boolean): void;
 }
 
 const SPINNER = ['|', '/', '-', '\\'];
@@ -32,7 +35,7 @@ function useSpinner(active: boolean): string {
   return SPINNER[i]!;
 }
 
-export function ReceivePage({ code, setEnergy }: Props) {
+export function ReceivePage({ code, setEnergy, setTransferring }: Props) {
   const side = useSideLayout();
   const receiverRef = useRef<Receiver | null>(null);
   const [snap, setSnap] = useState<ReceiveSnapshot | null>(null);
@@ -56,17 +59,19 @@ export function ReceivePage({ code, setEnergy }: Props) {
   const busy = status === 'receiving' || status === 'reconnecting' || status === 'finishing';
   useBeforeUnload(busy);
   useEffect(() => setEnergy(busy ? 0.5 : 0), [busy, setEnergy]);
+  useEffect(() => setTransferring(busy), [busy, setTransferring]);
   const spinner = useSpinner(status === 'connecting' || status === 'reconnecting' || status === 'finishing' || opening);
 
   const download = async (allowLargeMemory = false) => {
     const r = receiverRef.current;
-    if (!r || !r.saveName || opening) return;
+    const plan = r?.planDownload();
+    if (!r || !plan || opening) return;
     setOpening(true);
     setSaveError(null);
     try {
-      const sink = await openSink(r.saveName, r.saveSize, r.saveMime, { allowLargeMemory });
+      const sink = await openSink(plan.name, plan.size, plan.mime, { allowLargeMemory });
       setConfirmMemory(false);
-      r.start(sink);
+      if (!r.start(sink, plan)) void sink.writable.abort().catch(() => undefined);
     } catch (err) {
       if (err instanceof NeedsMemoryConfirmationError) setConfirmMemory(true);
       else if (!(err instanceof SaveCancelledError)) setSaveError(err instanceof Error ? err.message : String(err));
@@ -74,6 +79,57 @@ export function ReceivePage({ code, setEnergy }: Props) {
       setOpening(false);
     }
   };
+
+  const active = status === 'receiving' || status === 'reconnecting' || status === 'finishing';
+  const batch = snap?.batch ?? null;
+  const pending = snap?.pending ?? [];
+  const canDownload = (status === 'ready' || status === 'done') && pending.length > 0 && !snap?.hostGone;
+  // While downloading, the header describes this download; otherwise everything on offer.
+  const shown: FileMeta[] | null = active && batch ? batch.files : (snap?.files ?? null);
+  const shownBytes = shown?.reduce((a, f) => a + f.size, 0) ?? 0;
+  const pendingIds = new Set(pending.map((f) => f.id));
+
+  const downloadButton = (s: ReceiveSnapshot) => (
+    <>
+      {!confirmMemory && willBufferInMemory() && s.pendingBytes > BLOB_WARN_BYTES && (
+        <p className="notice notice--warn">
+          This browser can’t stream downloads to disk, so the whole {formatBytes(s.pendingBytes)} will be held in memory
+          first. Chrome, Edge or Firefox handle large files better.
+        </p>
+      )}
+      {confirmMemory ? (
+        <div className="confirm">
+          <p className="notice notice--warn">
+            Streaming to disk isn’t available here, so this {formatBytes(s.pendingBytes)} download has to be held in
+            memory until it finishes. That may crash the tab on low-memory devices.
+          </p>
+          <div className="row">
+            <button type="button" className="btn btn--primary" onClick={() => void download(true)}>
+              download anyway
+            </button>
+            <button type="button" className="btn btn--ghost" onClick={() => setConfirmMemory(false)}>
+              cancel
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button
+          type="button"
+          className="btn btn--primary btn--big"
+          onClick={() => void download()}
+          disabled={opening}
+          data-testid="download"
+        >
+          {opening
+            ? `${spinner} preparing…`
+            : s.downloadedCount === 0
+              ? 'download'
+              : `download ${pending.length === 1 ? 'it' : `all ${pending.length}`}`}
+        </button>
+      )}
+      {saveError && <p className="notice notice--bad">{saveError}</p>}
+    </>
+  );
 
   return (
     <main className={side ? 'stage stage--side' : 'stage'}>
@@ -90,22 +146,25 @@ export function ReceivePage({ code, setEnergy }: Props) {
           </>
         )}
 
-        {snap?.files && status !== 'connecting' && (
+        {shown && status !== 'connecting' && (
           <header className="card__header">
             <h1 className="card__title" data-testid="receive-name">
-              {snap.files.length === 1 ? snap.files[0]!.name : `${snap.files.length} files`}
+              {shown.length === 1 ? shown[0]!.name : `${shown.length} files`}
             </h1>
             <p className="card__meta" data-testid="receive-size">
-              {formatBytes(snap.totalBytes)}
-              {snap.files.length > 1 && ` · saved as ${snap.saveName}`}
+              {formatBytes(shownBytes)}
+              {active && batch && batch.files.length > 1 && ` · saved as ${batch.saveName}`}
             </p>
-            {snap.files.length > 1 && (
+            {shown.length > 1 && (
               <details className="file-list">
                 <summary>show files</summary>
                 <ul>
-                  {snap.files.map((f, i) => (
-                    <li key={i}>
-                      <span className="file-list__name">{f.name}</span>
+                  {shown.map((f) => (
+                    <li key={f.id}>
+                      <span className="file-list__name">
+                        {!active && !pendingIds.has(f.id) && <span className="file-list__done">✓ </span>}
+                        {f.name}
+                      </span>
                       <span className="file-list__size">{formatBytes(f.size)}</span>
                     </li>
                   ))}
@@ -115,47 +174,13 @@ export function ReceivePage({ code, setEnergy }: Props) {
           </header>
         )}
 
-        {status === 'ready' && (
-          <>
-            {!confirmMemory && willBufferInMemory() && snap!.totalBytes > BLOB_WARN_BYTES && (
-              <p className="notice notice--warn">
-                This browser can’t stream downloads to disk, so the whole {formatBytes(snap!.totalBytes)} will be held
-                in memory first. Chrome, Edge or Firefox handle large files better.
-              </p>
-            )}
-            {confirmMemory ? (
-              <div className="confirm">
-                <p className="notice notice--warn">
-                  Streaming to disk isn’t available here, so this {formatBytes(snap!.totalBytes)} download has to be
-                  held in memory until it finishes. That may crash the tab on low-memory devices.
-                </p>
-                <div className="row">
-                  <button type="button" className="btn btn--primary" onClick={() => void download(true)}>
-                    download anyway
-                  </button>
-                  <button type="button" className="btn btn--ghost" onClick={() => setConfirmMemory(false)}>
-                    cancel
-                  </button>
-                </div>
-              </div>
-            ) : (
-              <button
-                type="button"
-                className="btn btn--primary btn--big"
-                onClick={() => void download()}
-                disabled={opening}
-                data-testid="download"
-              >
-                {opening ? `${spinner} preparing…` : 'download'}
-              </button>
-            )}
-            {saveError && <p className="notice notice--bad">{saveError}</p>}
-          </>
-        )}
+        {status === 'ready' &&
+          snap &&
+          (pending.length > 0 ? downloadButton(snap) : <p className="fine">Nothing is shared yet.</p>)}
 
-        {(status === 'receiving' || status === 'reconnecting' || status === 'finishing') && snap && (
+        {active && snap && batch && (
           <div className="transfer">
-            <AsciiProgress value={snap.bytes} max={snap.totalBytes} label="Download progress" />
+            <AsciiProgress value={batch.bytes} max={batch.total} label="Download progress" />
             <p className="receiver__stats" data-testid="receive-stats">
               {status === 'reconnecting' ? (
                 <>
@@ -167,17 +192,24 @@ export function ReceivePage({ code, setEnergy }: Props) {
                 </>
               ) : (
                 <>
-                  {formatBytes(snap.bytes)} of {formatBytes(snap.totalBytes)} · {formatSpeed(snap.speed)} ·{' '}
+                  {formatBytes(batch.bytes)} of {formatBytes(batch.total)} · {formatSpeed(snap.speed)} ·{' '}
                   {Number.isFinite(snap.eta) ? `${formatDuration(snap.eta)} left` : 'estimating…'}
                 </>
               )}
             </p>
-            {snap.files && snap.files.length > 1 && status === 'receiving' && (
+            {batch.files.length > 1 && status === 'receiving' && (
               <p className="fine">
-                file {snap.fileIndex + 1} of {snap.files.length}: {snap.files[snap.fileIndex]?.name}
+                file {batch.fileIndex + 1} of {batch.files.length}: {batch.files[batch.fileIndex]?.name}
               </p>
             )}
-            {snap.sinkKind && <p className="fine">{SINK_LABELS[snap.sinkKind]}</p>}
+            {snap.sinkKind && <p className="fine">{SINK_LABELS[snap.sinkKind]} · every block SHA-256 checked</p>}
+            <Repaired n={snap.repaired} />
+            {pending.length > 0 && (
+              <p className="fine">
+                The sender added {pending.length} more file{pending.length === 1 ? '' : 's'}; you can download{' '}
+                {pending.length === 1 ? 'it' : 'them'} after this.
+              </p>
+            )}
             {status !== 'finishing' && (
               <button type="button" className="btn btn--ghost" onClick={() => receiverRef.current?.cancel()}>
                 cancel
@@ -186,14 +218,28 @@ export function ReceivePage({ code, setEnergy }: Props) {
           </div>
         )}
 
-        {status === 'done' && snap && (
-          <div className="done" data-testid="receive-done">
+        {status === 'done' && snap && batch && (
+          <div className="done" data-testid="receive-done" data-batch={batch.n}>
             <p className="done__title">Done ✓</p>
             <p className="fine">
-              {snap.verified === 1 ? 'SHA-256 verified.' : `All ${snap.verified} files SHA-256 verified.`}{' '}
+              {batch.verified === 1 ? 'SHA-256 verified.' : `All ${batch.verified} files SHA-256 verified.`}{' '}
               {snap.sinkKind === 'file-system-access' ? 'Saved where you chose.' : 'Check your downloads.'}
             </p>
-            <a className="btn" href="/">
+            <Repaired n={snap.repaired} />
+            {canDownload ? (
+              <>
+                <p className="notice" data-testid="new-files">
+                  The sender added {pending.length} more file{pending.length === 1 ? '' : 's'} (
+                  {formatBytes(snap.pendingBytes)}).
+                </p>
+                {downloadButton(snap)}
+              </>
+            ) : snap.hostGone ? (
+              <p className="fine">The sender has stopped sharing.</p>
+            ) : (
+              <p className="fine">Keep this page open to get anything else they add.</p>
+            )}
+            <a className="btn" href={BASE_PATH}>
               send something back
             </a>
           </div>
@@ -217,7 +263,7 @@ export function ReceivePage({ code, setEnergy }: Props) {
                   try again
                 </button>
               )}
-              <a className="btn btn--ghost" href="/">
+              <a className="btn btn--ghost" href={BASE_PATH}>
                 share your own files
               </a>
             </div>
@@ -225,5 +271,15 @@ export function ReceivePage({ code, setEnergy }: Props) {
         )}
       </section>
     </main>
+  );
+}
+
+/** Corruption that the per-block check caught and repaired, reported rather than hidden. */
+function Repaired({ n }: { n: number }) {
+  if (n === 0) return null;
+  return (
+    <p className="fine" data-testid="repaired" data-count={n}>
+      {n === 1 ? '1 damaged block was' : `${n} damaged blocks were`} caught by the SHA-256 check and fetched again.
+    </p>
   );
 }

@@ -192,3 +192,94 @@ export function drawPizzaSlice(ctx: CanvasRenderingContext2D): void {
 
   ctx.restore();
 }
+
+// ─── Whole pizza (the 404 page) ─────────────────────────────────────────────
+
+/** Outer radius of the whole pizza, in local units centred on (0, 0). */
+export const WHOLE_RADIUS = 106;
+
+/**
+ * A whole pizza, centred on (0, 0) and seen from above: crust, sauce rim,
+ * cheese with drips, cut lines, pepperoni, basil. Nothing in it depends on
+ * the direction of the light, so it can be spun freely.
+ */
+export function drawWholePizza(ctx: CanvasRenderingContext2D): void {
+  ctx.save();
+
+  // Crust: dark underside, main bake, a puffy highlight ring.
+  disc(ctx, 0, 0, WHOLE_RADIUS, M['crust-dark']!);
+  disc(ctx, 0, 0, WHOLE_RADIUS - 4, M.crust!);
+  ctx.beginPath();
+  ctx.arc(0, 0, WHOLE_RADIUS - 8.5, 0, Math.PI * 2);
+  ctx.lineWidth = 4.5;
+  ctx.strokeStyle = M['crust-light']!;
+  ctx.stroke();
+
+  // Sauce rim, then cheese whose wobbly edge drips over it here and there.
+  disc(ctx, 0, 0, WHOLE_RADIUS - 13, M.sauce!);
+  ctx.beginPath();
+  const steps = 180;
+  for (let i = 0; i <= steps; i++) {
+    const a = (i / steps) * Math.PI * 2;
+    const drip = Math.max(0, Math.sin(a * 9 + 0.4)) ** 3 * 6;
+    const r = WHOLE_RADIUS - 21 + drip + Math.sin(a * 31) * 0.8;
+    ctx.lineTo(r * Math.cos(a), r * Math.sin(a));
+  }
+  ctx.closePath();
+  ctx.fillStyle = M.cheese!;
+  ctx.fill();
+
+  // Cut into eight slices.
+  ctx.lineWidth = 4;
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = M['cheese-shade']!;
+  for (let k = 0; k < 8; k++) {
+    const a = (k * Math.PI) / 4 + 0.2;
+    ctx.beginPath();
+    ctx.moveTo(4 * Math.cos(a), 4 * Math.sin(a));
+    ctx.lineTo((WHOLE_RADIUS - 20) * Math.cos(a), (WHOLE_RADIUS - 20) * Math.sin(a));
+    ctx.stroke();
+  }
+
+  // Melty bubbles.
+  for (const [r, a, size] of [
+    [22, 2.2, 4],
+    [48, 1.1, 3.6],
+    [72, 3.0, 4.2],
+    [44, 3.6, 3.4],
+    [78, 5.5, 3.8],
+  ] as const) {
+    disc(ctx, r * Math.cos(a), r * Math.sin(a), size, M['cheese-light']!);
+  }
+
+  // Pepperoni: dark rim, lighter face, a couple of charred spots.
+  // Bigger than the slice's: the whole pizza gets fewer glyphs per unit, and toppings must still read as shapes.
+  for (const [r, a, size] of [
+    [63, 0.6, 14.5],
+    [61, 2.15, 14],
+    [64, 3.7, 15],
+    [62, 5.2, 14],
+    [30, 1.4, 13],
+    [32, 4.3, 13.5],
+    [8, 2.9, 10],
+  ] as const) {
+    const x = r * Math.cos(a);
+    const y = r * Math.sin(a);
+    disc(ctx, x, y, size, M['pepperoni-dark']!);
+    disc(ctx, x - 0.8, y - 0.8, size - 2.4, M.pepperoni!);
+    disc(ctx, x + size * 0.3, y + size * 0.15, size * 0.18, M['pepperoni-dark']!);
+    disc(ctx, x - size * 0.35, y + size * 0.3, size * 0.14, M['pepperoni-dark']!);
+  }
+
+  // Basil.
+  for (const [r, a, len, rot] of [
+    [50, 5.95, 22, 0.9],
+    [52, 2.95, 21, -0.4],
+    [74, 1.4, 19, 0.2],
+    [26, 0.1, 18, 1.4],
+  ] as const) {
+    leaf(ctx, r * Math.cos(a), r * Math.sin(a), len, len * 0.42, rot);
+  }
+
+  ctx.restore();
+}

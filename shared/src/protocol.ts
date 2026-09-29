@@ -9,7 +9,10 @@
  *     Control messages are JSON strings; file bytes are binary messages.
  */
 
-export const PROTOCOL_VERSION = 1;
+/**
+ * Version of the peer protocol, announced in the manifest. 2 added per-block SHA-256, batch requests and file ids.
+ */
+export const PROTOCOL_VERSION = 2;
 
 /** Path the WebSocket signaling endpoint is served on. */
 export const SIGNAL_PATH = '/ws';
@@ -86,6 +89,8 @@ export type ServerMessage =
 // ─── Peer (data channel) ───────────────────────────────────────────────────
 
 export interface FileMeta {
+  /** Stable id of the file within a share. Ids are never reused, so they survive files being added or removed. */
+  id: number;
   name: string;
   size: number;
   type: string;
@@ -94,21 +99,37 @@ export interface FileMeta {
 
 /** Sender → receiver control messages. */
 export type SenderMessage =
+  /** Everything currently on offer. Sent when the channel opens and again whenever the sender adds or removes files. */
   | { type: 'manifest'; version: number; files: FileMeta[] }
-  /** All bytes of file `index` have been sent; `sha256` is the hex digest of the whole file. */
-  | { type: 'file-end'; index: number; sha256: string }
+  /**
+   * The next `size` binary bytes on the channel are bytes `offset..offset+size` of file `id`, and their SHA-256 is
+   * `sha256`. `seq` is the request this block answers, so bytes from a superseded request can be told apart.
+   */
+  | { type: 'block'; seq: number; id: number; offset: number; size: number; sha256: string }
+  /** Every block of file `id` has been sent. */
+  | { type: 'file-end'; seq: number; id: number }
   | { type: 'error'; message: string };
 
 /** Receiver → sender control messages. */
 export type ReceiverMessage =
-  /** Start (or resume) sending file `index` from byte `offset`. */
-  | { type: 'request'; index: number; offset: number }
-  /** The receiver has consumed (written to disk) `bytes` bytes of file `index`. Drives flow control. */
-  | { type: 'ack'; index: number; bytes: number }
-  /** Everything received, verified and saved. */
+  /**
+   * Send files `files` back to back, starting the first one at byte `offset` (a block boundary) and the rest from
+   * the beginning. Supersedes any earlier request. `written` and `total` describe the whole download, for the
+   * sender's progress display.
+   */
+  | { type: 'request'; seq: number; files: number[]; offset: number; written: number; total: number }
+  /**
+   * Flow control: `bytes` is how many binary bytes received on this channel the receiver has finished with (written
+   * to disk, or discarded). `written` / `total` is the download's progress.
+   */
+  | { type: 'ack'; bytes: number; written: number; total: number }
+  /** The current download is received, verified and saved. The receiver may start another one later. */
   | { type: 'done' }
   /** Receiver gave up; stop sending. */
   | { type: 'cancel' };
+
+/** Largest block a sender may announce; the receiver allocates a buffer this size for it. */
+export const MAX_BLOCK_SIZE = 16 * 1024 * 1024;
 
 // ─── Validation ────────────────────────────────────────────────────────────
 
@@ -180,7 +201,7 @@ export function parseClientMessage(raw: unknown): ClientMessage | null {
   }
 }
 
-function isIceServer(v: unknown): v is IceServerConfig {
+export function isIceServer(v: unknown): v is IceServerConfig {
   if (!isObj(v)) return false;
   const urlsOk = isStr(v.urls) || (Array.isArray(v.urls) && v.urls.every((u) => isStr(u)));
   return (
@@ -228,11 +249,19 @@ export function parseServerMessage(raw: unknown): ServerMessage | null {
   }
 }
 
-const MAX_FILES = 10_000;
+export const MAX_FILES = 10_000;
+
+const isSha256 = (v: unknown): v is string => typeof v === 'string' && /^[0-9a-f]{64}$/.test(v);
 
 function isFileMeta(v: unknown): v is FileMeta {
   return (
-    isObj(v) && isStr(v.name, 1024) && v.name.length > 0 && isNat(v.size) && isStr(v.type, 256) && isNat(v.lastModified)
+    isObj(v) &&
+    isNat(v.id) &&
+    isStr(v.name, 1024) &&
+    v.name.length > 0 &&
+    isNat(v.size) &&
+    isStr(v.type, 256) &&
+    isNat(v.lastModified)
   );
 }
 
@@ -240,18 +269,27 @@ export function parseSenderMessage(raw: unknown): SenderMessage | null {
   const m = parseJson(raw);
   if (!m) return null;
   switch (m.type) {
-    case 'manifest':
-      return isNat(m.version) &&
-        Array.isArray(m.files) &&
-        m.files.length > 0 &&
-        m.files.length <= MAX_FILES &&
-        m.files.every(isFileMeta)
-        ? { type: 'manifest', version: m.version, files: m.files }
+    case 'manifest': {
+      if (!isNat(m.version)) return null;
+      // Another protocol version: pass the version through so the receiver can say so.
+      if (m.version !== PROTOCOL_VERSION) return { type: 'manifest', version: m.version, files: [] };
+      if (!Array.isArray(m.files) || m.files.length > MAX_FILES || !m.files.every(isFileMeta)) return null;
+      const files = m.files as FileMeta[];
+      if (new Set(files.map((f) => f.id)).size !== files.length) return null;
+      return { type: 'manifest', version: m.version, files };
+    }
+    case 'block':
+      return isNat(m.seq) &&
+        isNat(m.id) &&
+        isNat(m.offset) &&
+        isNat(m.size) &&
+        m.size > 0 &&
+        m.size <= MAX_BLOCK_SIZE &&
+        isSha256(m.sha256)
+        ? { type: 'block', seq: m.seq, id: m.id, offset: m.offset, size: m.size, sha256: m.sha256 }
         : null;
     case 'file-end':
-      return isNat(m.index) && typeof m.sha256 === 'string' && /^[0-9a-f]{64}$/.test(m.sha256)
-        ? { type: 'file-end', index: m.index, sha256: m.sha256 }
-        : null;
+      return isNat(m.seq) && isNat(m.id) ? { type: 'file-end', seq: m.seq, id: m.id } : null;
     case 'error':
       return isStr(m.message) ? { type: 'error', message: m.message } : null;
     default:
@@ -264,9 +302,27 @@ export function parseReceiverMessage(raw: unknown): ReceiverMessage | null {
   if (!m) return null;
   switch (m.type) {
     case 'request':
-      return isNat(m.index) && isNat(m.offset) ? { type: 'request', index: m.index, offset: m.offset } : null;
+      return isNat(m.seq) &&
+        Array.isArray(m.files) &&
+        m.files.length > 0 &&
+        m.files.length <= MAX_FILES &&
+        m.files.every(isNat) &&
+        isNat(m.offset) &&
+        isNat(m.written) &&
+        isNat(m.total)
+        ? {
+            type: 'request',
+            seq: m.seq,
+            files: m.files as number[],
+            offset: m.offset,
+            written: m.written,
+            total: m.total,
+          }
+        : null;
     case 'ack':
-      return isNat(m.index) && isNat(m.bytes) ? { type: 'ack', index: m.index, bytes: m.bytes } : null;
+      return isNat(m.bytes) && isNat(m.written) && isNat(m.total)
+        ? { type: 'ack', bytes: m.bytes, written: m.written, total: m.total }
+        : null;
     case 'done':
       return { type: 'done' };
     case 'cancel':

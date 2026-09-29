@@ -2,32 +2,41 @@ const KiB = 1024;
 const MiB = 1024 * KiB;
 
 /**
- * Size of each binary data-channel message. 64 KiB is the largest size every
- * browser pair accepts (older Safari advertises a 64 KiB SCTP max-message-size).
+ * Largest binary data-channel message we send. The real size is the smaller of this and the connection's negotiated
+ * `sctp.maxMessageSize`: 256 KiB between Chromium/Firefox/current Safari, 64 KiB with older Safari. Bigger messages
+ * mean 4× fewer `send()` calls and `message` events per byte, which is most of the per-byte JavaScript cost.
  */
-export const CHUNK_SIZE = 64 * KiB;
-
-/** How much of the file is read from disk per `Blob.slice().arrayBuffer()` call (then split into chunks). */
-export const READ_SIZE = 1 * MiB;
+export const CHUNK_SIZE = 256 * KiB;
 
 /**
- * Sender-side back-pressure: stop calling `send()` while the channel's
- * `bufferedAmount` is above HIGH_WATER, resume on `bufferedamountlow`
- * (fired when it drops to LOW_WATER). Chrome closes a channel whose buffer
- * exceeds 16 MiB, so HIGH_WATER + one chunk must stay well below that.
+ * Integrity unit. The sender reads the file one block at a time and hashes each block with the browser's native
+ * SHA-256 (WebCrypto); the receiver checks every block before a single byte of it reaches the disk. A block that
+ * fails is simply fetched again, so corruption costs one block rather than the whole download. It is also the read
+ * size on the sender and the write size on the receiver: big, infrequent disk I/O is cheaper than small writes.
  */
-export const HIGH_WATER = 4 * MiB;
-export const LOW_WATER = 1 * MiB;
+export const BLOCK_SIZE = 4 * MiB;
+
+/** How many times one block may fail its check before the download is abandoned. */
+export const MAX_BLOCK_RETRIES = 3;
 
 /**
- * End-to-end flow control: the sender never has more than WINDOW bytes of a
- * file in flight that the receiver hasn't yet written to disk. Without this a
- * slow disk on the receiving side would make the receiver buffer the whole
- * file in RAM (WebRTC has no receive-side back-pressure).
+ * Sender-side back-pressure: stop calling `send()` while the channel's `bufferedAmount` is above HIGH_WATER, resume
+ * on `bufferedamountlow` (fired at LOW_WATER). LOW_WATER is kept high enough that the SCTP stack still has several
+ * megabytes queued while JavaScript refills the buffer (at 1 Gbit/s, 1 MiB drains in 8 ms). Chrome closes a channel
+ * whose buffer exceeds 16 MiB, so HIGH_WATER + one chunk stays well below that.
  */
-export const WINDOW = 16 * MiB;
+export const HIGH_WATER = 8 * MiB;
+export const LOW_WATER = 4 * MiB;
 
-/** Receiver acknowledges consumed bytes every ACK_EVERY bytes. */
+/**
+ * End-to-end flow control: the sender never has more than WINDOW bytes on this connection that the receiver hasn't
+ * yet written to disk (or thrown away). Without this a slow disk on the receiving side would make the receiver
+ * buffer the whole file in RAM (WebRTC has no receive-side back-pressure). It has to cover the sender's own buffer,
+ * the network's bandwidth × round trip, and the receiver's block being assembled and checked.
+ */
+export const WINDOW = 48 * MiB;
+
+/** Receiver acknowledges finished bytes at least every ACK_EVERY bytes. */
 export const ACK_EVERY = 1 * MiB;
 
 /** Above this, the in-memory Blob fallback shows a warning before starting. */
@@ -38,3 +47,13 @@ export const CONNECT_TIMEOUT_MS = 25_000;
 
 /** Reconnection attempts after a receiver's connection drops mid-transfer. */
 export const MAX_RECONNECTS = 5;
+
+/**
+ * A download that makes no progress at all (nothing received, nothing written) for this long is presumed stuck,
+ * e.g. a network path that died without the connection noticing: the receiver reconnects and resumes from the last
+ * verified block.
+ */
+export const STALL_MS = 20_000;
+
+/** Stall recoveries in a row, without any bytes written in between, before the download is given up. */
+export const MAX_STALL_RECOVERIES = 3;
