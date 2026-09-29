@@ -1,17 +1,71 @@
 import {
+  isIceServer,
   parseServerMessage,
   SIGNAL_PATH,
   type ClientMessage,
   type IceServerConfig,
   type ServerMessage,
 } from '@pizzadrop/shared';
+import { PeerJsSignaling } from './peerjs';
 
 export interface SignalingHandlers {
-  /** Socket (re)opened and the server said hello. */
+  /** Connected (or reconnected) and ready for `host` / `join`. */
   onReady(hello: Extract<ServerMessage, { t: 'hello' }>): void;
   onMessage(msg: ServerMessage): void;
-  /** Socket closed; `retrying` tells whether a reconnect is scheduled. */
+  /** Connection lost; `retrying` tells whether a reconnect is scheduled. */
   onDisconnect?(retrying: boolean): void;
+}
+
+/**
+ * How the sender and receivers find each other. Only signaling goes through
+ * here — once peers are connected, file bytes flow directly between browsers.
+ */
+export interface Signaling {
+  iceServers: IceServerConfig[];
+  /** Canonical origin for share links, if the deployment sets one. */
+  publicUrl: string | null;
+  readonly isOpen: boolean;
+  connect(): void;
+  send(msg: ClientMessage): boolean;
+  /** Close for good (no reconnect). */
+  close(): void;
+}
+
+const env = import.meta.env;
+
+/** The transport this build was configured with (see `client/.env.static` and README → Static hosting). */
+export function createSignaling(handlers: SignalingHandlers): Signaling {
+  if (env.VITE_SIGNALING === 'peerjs') {
+    return new PeerJsSignaling(handlers, {
+      url: env.VITE_PEERJS_URL || 'wss://0.peerjs.com/peerjs',
+      key: env.VITE_PEERJS_KEY || 'peerjs',
+      iceServers: iceServersFromEnv(),
+      publicUrl: publicUrlFromEnv(),
+      codeLength: env.VITE_CODE_LENGTH === '5' ? 5 : 6,
+    });
+  }
+  return new SignalingClient(handlers, env.VITE_SIGNAL_URL || signalingUrl());
+}
+
+const DEFAULT_ICE_SERVERS: IceServerConfig[] = [
+  { urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] },
+];
+
+function iceServersFromEnv(): IceServerConfig[] {
+  if (!env.VITE_ICE_SERVERS) return DEFAULT_ICE_SERVERS;
+  try {
+    const parsed: unknown = JSON.parse(env.VITE_ICE_SERVERS);
+    if (Array.isArray(parsed) && parsed.every(isIceServer)) return parsed;
+  } catch {
+    // fall through
+  }
+  console.error('[signaling] VITE_ICE_SERVERS is not a JSON array of RTCIceServer objects; using STUN defaults');
+  return DEFAULT_ICE_SERVERS;
+}
+
+function publicUrlFromEnv(): string | null {
+  const v = env.VITE_PUBLIC_URL?.trim().replace(/\/+$/, '');
+  return v && /^https?:\/\/[^/]+$/.test(v) ? v : null;
 }
 
 export function signalingUrl(): string {
@@ -20,11 +74,10 @@ export function signalingUrl(): string {
 }
 
 /**
- * WebSocket to the signaling server with automatic reconnect (exponential
- * backoff, capped at 10 s). Only signaling goes through here — once peers are
- * connected, file bytes flow directly between browsers.
+ * WebSocket to the PizzaDrop signaling server (`server/`) with automatic
+ * reconnect (exponential backoff, capped at 10 s).
  */
-export class SignalingClient {
+export class SignalingClient implements Signaling {
   private ws: WebSocket | null = null;
   private closed = false;
   private attempt = 0;
@@ -77,7 +130,6 @@ export class SignalingClient {
     return true;
   }
 
-  /** Close for good (no reconnect). */
   close(): void {
     this.closed = true;
     clearTimeout(this.retryTimer);

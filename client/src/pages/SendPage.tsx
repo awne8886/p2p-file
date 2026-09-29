@@ -1,4 +1,4 @@
-import { formatBytes, formatDuration, formatSpeed } from '@pizzadrop/shared';
+import { formatBytes, formatDuration, formatSpeed, type FileMeta } from '@pizzadrop/shared';
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { AsciiProgress } from '../components/AsciiProgress';
 import { QrCode } from '../components/QrCode';
@@ -9,6 +9,8 @@ import { Host, type HostSnapshot, type ReceiverSnapshot } from '../lib/sender';
 
 interface Props {
   setEnergy(energy: number): void;
+  /** Tells the background a transfer is running (it animates more cheaply then). */
+  setTransferring(transferring: boolean): void;
 }
 
 /** Collect dropped files, rejecting folders (which show up as zero-byte "files"). */
@@ -35,16 +37,21 @@ function filesFromDrop(dt: DataTransfer): { files: File[]; hadFolder: boolean } 
 
 const hasFiles = (e: DragEvent) => Array.from(e.dataTransfer?.types ?? []).includes('Files');
 
-export function SendPage({ setEnergy }: Props) {
+export function SendPage({ setEnergy, setTransferring }: Props) {
   const [host, setHost] = useState<Host | null>(null);
   const [snap, setSnap] = useState<HostSnapshot | null>(null);
   const [dragging, setDragging] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
+  /** Start sharing, or add to the live share. */
   const share = useCallback(
     (files: File[]) => {
-      if (files.length === 0 || host) return;
+      if (files.length === 0) return;
+      if (host) {
+        host.addFiles(files);
+        return;
+      }
       setNotice(null);
       const h = new Host(files, setSnap);
       setHost(h);
@@ -59,9 +66,9 @@ export function SendPage({ setEnergy }: Props) {
     setSnap(null);
   };
 
-  // Whole-window drag & drop.
+  // Whole-window drag & drop (and paste): starts a share, or adds to the live one.
   useEffect(() => {
-    if (host) return;
+    if (snap?.status === 'stopped' || snap?.status === 'expired' || snap?.status === 'error') return;
     let depth = 0;
     const onEnter = (e: DragEvent) => {
       if (!hasFiles(e)) return;
@@ -85,13 +92,13 @@ export function SendPage({ setEnergy }: Props) {
       depth = 0;
       setDragging(false);
       const { files, hadFolder } = filesFromDrop(e.dataTransfer);
-      if (hadFolder) {
-        setNotice(
-          files.length > 0
+      setNotice(
+        hadFolder
+          ? files.length > 0
             ? 'Folders were skipped — zip them first to send them.'
-            : 'Folders can’t be sent directly — zip it first, or drop the files inside.',
-        );
-      }
+            : 'Folders can’t be sent directly — zip it first, or drop the files inside.'
+          : null,
+      );
       share(files);
     };
     const onPaste = (e: ClipboardEvent) => {
@@ -110,7 +117,7 @@ export function SendPage({ setEnergy }: Props) {
       window.removeEventListener('drop', onDrop);
       window.removeEventListener('paste', onPaste);
     };
-  }, [host, share]);
+  }, [share, snap?.status]);
 
   // Release the code as soon as the tab goes away (not just after the server notices).
   useEffect(() => {
@@ -127,6 +134,7 @@ export function SendPage({ setEnergy }: Props) {
   useEffect(() => {
     setEnergy(dragging ? 1 : transferring ? 0.5 : 0);
   }, [dragging, transferring, setEnergy]);
+  useEffect(() => setTransferring(transferring), [transferring, setTransferring]);
 
   if (!host || !snap) {
     const pick = () => inputRef.current?.click();
@@ -178,7 +186,16 @@ export function SendPage({ setEnergy }: Props) {
     );
   }
 
-  return <HostingCard snap={snap} onStop={reset} notice={notice} />;
+  return (
+    <HostingCard
+      snap={snap}
+      onStop={reset}
+      onAdd={share}
+      onRemove={(id) => host.removeFile(id)}
+      dragging={dragging}
+      notice={notice}
+    />
+  );
 }
 
 function statusLine(snap: HostSnapshot): { text: string; tone: 'live' | 'wait' | 'bad' } {
@@ -198,38 +215,36 @@ function statusLine(snap: HostSnapshot): { text: string; tone: 'live' | 'wait' |
   }
 }
 
-function HostingCard({ snap, onStop, notice }: { snap: HostSnapshot; onStop(): void; notice: string | null }) {
+interface HostingCardProps {
+  snap: HostSnapshot;
+  onStop(): void;
+  onAdd(files: File[]): void;
+  onRemove(id: number): void;
+  dragging: boolean;
+  notice: string | null;
+}
+
+function HostingCard({ snap, onStop, onAdd, onRemove, dragging, notice }: HostingCardProps) {
   const side = useSideLayout();
   const status = statusLine(snap);
   const fileCount = snap.files.length;
-  const hashing = snap.hashedBytes < snap.totalBytes;
   const doneCount = snap.receivers.filter((r) => r.status === 'done').length;
+  const open = snap.status === 'live' || snap.status === 'reconnecting' || snap.status === 'connecting';
 
   return (
     <main className={side ? 'stage stage--side' : 'stage'}>
       <section className="panel panel--card" aria-labelledby="share-heading" data-testid="hosting-card">
         <header className="card__header">
-          <h1 id="share-heading" className="card__title">
+          <h1 id="share-heading" className="card__title" data-testid="share-title">
             {fileCount === 1 ? snap.files[0]!.name : `${fileCount} files`}
           </h1>
           <p className="card__meta">
             {formatBytes(snap.totalBytes)}
             {fileCount > 1 && ' · zipped on the receiver’s side'}
           </p>
-          {fileCount > 1 && (
-            <details className="file-list">
-              <summary>show files</summary>
-              <ul>
-                {snap.files.map((f, i) => (
-                  <li key={i}>
-                    <span className="file-list__name">{f.name}</span>
-                    <span className="file-list__size">{formatBytes(f.size)}</span>
-                  </li>
-                ))}
-              </ul>
-            </details>
-          )}
         </header>
+
+        {open && <FileQueue files={snap.files} onAdd={onAdd} onRemove={onRemove} dragging={dragging} />}
 
         <p className={`status status--${status.tone}`} role="status" data-testid="host-status">
           <span className="status__dot" aria-hidden="true" />
@@ -252,12 +267,6 @@ function HostingCard({ snap, onStop, notice }: { snap: HostSnapshot; onStop(): v
           <strong>Keep this tab open.</strong> Files stream directly from this tab to each receiver; closing it ends the
           share.
         </p>
-
-        {hashing && (
-          <p className="fine">
-            fingerprinting (SHA-256) {Math.floor((snap.hashedBytes / Math.max(1, snap.totalBytes)) * 100)}%
-          </p>
-        )}
 
         <section className="receivers" aria-label="Receivers">
           <h2 className="receivers__title">
@@ -290,6 +299,65 @@ function HostingCard({ snap, onStop, notice }: { snap: HostSnapshot; onStop(): v
   );
 }
 
+/** The files on offer, with "add files" and (while more than one is left) per-file remove. */
+function FileQueue({
+  files,
+  onAdd,
+  onRemove,
+  dragging,
+}: {
+  files: FileMeta[];
+  onAdd(files: File[]): void;
+  onRemove(id: number): void;
+  dragging: boolean;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const many = files.length > 1;
+  return (
+    <section className={`queue${dragging ? ' queue--drop' : ''}`} aria-label="Shared files">
+      {many && (
+        <ul className="queue__list" data-testid="file-queue">
+          {files.map((f) => (
+            <li key={f.id} className="queue__item">
+              <span className="queue__name">{f.name}</span>
+              <span className="queue__size">{formatBytes(f.size)}</span>
+              <button
+                type="button"
+                className="queue__remove"
+                onClick={() => onRemove(f.id)}
+                aria-label={`Stop sharing ${f.name}`}
+                title="stop sharing this file"
+              >
+                ×
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="queue__actions">
+        <button type="button" className="btn btn--small" onClick={() => inputRef.current?.click()}>
+          + add files
+        </button>
+        <span className="fine">
+          {dragging ? 'release to add them to this share' : 'or drop more anywhere — receivers see them straight away'}
+        </span>
+      </div>
+      <input
+        ref={inputRef}
+        type="file"
+        multiple
+        hidden
+        data-testid="add-file-input"
+        onChange={(e) => {
+          const picked = Array.from(e.currentTarget.files ?? []);
+          e.currentTarget.value = '';
+          onAdd(picked);
+        }}
+      />
+    </section>
+  );
+}
+
 const isConnected = (r: ReceiverSnapshot) => r.status === 'connected' || r.status === 'receiving';
 
 const RECEIVER_STATUS: Record<ReceiverSnapshot['status'], string> = {
@@ -308,7 +376,7 @@ function ReceiverRow({ r }: { r: ReceiverSnapshot }) {
         <span className="receiver__name">receiver {r.n}</span>
         <span className="receiver__state">{RECEIVER_STATUS[r.status]}</span>
       </div>
-      {(r.status === 'receiving' || r.status === 'done' || r.bytes > 0) && (
+      {r.total > 0 && (r.status === 'receiving' || r.status === 'done' || r.bytes > 0) && (
         <AsciiProgress value={r.bytes} max={r.total} label={`Receiver ${r.n} progress`} />
       )}
       {r.status === 'receiving' && (

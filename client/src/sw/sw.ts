@@ -15,8 +15,12 @@ import type { PagePortMessage, SwPortMessage, SwRegisterMessage } from '../lib/s
 
 const sw = self as unknown as ServiceWorkerGlobalScope;
 
-/** Keep in sync with SW_DOWNLOAD_PREFIX in lib/swProtocol.ts. */
-const PREFIX = '/__pizzadrop/dl/';
+/**
+ * Download URLs live under the worker's scope, which is wherever the app is
+ * served from (`/`, or e.g. `/p2p-file/` on GitHub Pages).
+ * Keep the path in sync with SW_DOWNLOAD_PATH in lib/swProtocol.ts.
+ */
+const PREFIX = new URL('__pizzadrop/dl/', sw.registration.scope).pathname;
 const HIGH_WATER_MARK = 1024 * 1024;
 const REGISTRATION_TTL_MS = 60_000;
 

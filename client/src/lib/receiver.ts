@@ -1,18 +1,26 @@
 import { makeZip, predictLength } from 'client-zip';
 import {
   parseSenderMessage,
+  PROTOCOL_VERSION,
   type FileMeta,
   type ReceiverMessage,
   type SenderMessage,
   type ServerMessage,
 } from '@pizzadrop/shared';
-import { ACK_EVERY, CONNECT_TIMEOUT_MS, MAX_RECONNECTS, WINDOW } from './constants';
+import {
+  ACK_EVERY,
+  CONNECT_TIMEOUT_MS,
+  MAX_BLOCK_RETRIES,
+  MAX_RECONNECTS,
+  MAX_STALL_RECOVERIES,
+  STALL_MS,
+} from './constants';
+import { sha256Hex } from './digest';
 import { Notifier } from './flow';
-import { StreamHasher } from './hasher';
 import { randomId } from './ids';
 import { sanitizeName, uniqueNames } from './names';
 import { PeerLink } from './rtc';
-import { SignalingClient } from './signaling';
+import { createSignaling, type Signaling } from './signaling';
 import type { Sink, SinkKind } from './sinks';
 import { SpeedMeter } from './speed';
 
@@ -21,19 +29,48 @@ export type ReceiveStatus = 'connecting' | 'ready' | 'receiving' | 'reconnecting
 export type ReceiveErrorKind =
   'not-found' | 'host-left' | 'unreachable' | 'integrity' | 'sender' | 'save' | 'network' | 'cancelled';
 
+export interface BatchSnapshot {
+  /** 1 for the first download from this share, 2 for the next… */
+  n: number;
+  files: FileMeta[];
+  /** Name the download is saved under (the file itself, or a .zip for several). */
+  saveName: string;
+  total: number;
+  bytes: number;
+  /** Position (in `files`) of the file currently arriving. */
+  fileIndex: number;
+  /** Files received, verified and handed to the save. */
+  verified: number;
+}
+
 export interface ReceiveSnapshot {
   status: ReceiveStatus;
+  /** Everything the sender offers right now. */
   files: FileMeta[] | null;
-  /** Name the download is saved under (the file itself, or a .zip for several). */
-  saveName: string | null;
-  totalBytes: number;
-  bytes: number;
+  /** Offered files that haven't been downloaded yet: what the download button fetches. */
+  pending: FileMeta[];
+  pendingBytes: number;
+  /** How many files have been saved so far, across downloads. */
+  downloadedCount: number;
+  /** The download in progress, or the last one. */
+  batch: BatchSnapshot | null;
   speed: number;
   eta: number;
-  fileIndex: number;
-  verified: number;
   sinkKind: SinkKind | null;
+  /** Blocks that failed their SHA-256 check and were fetched again. */
+  repaired: number;
+  /** The sender stopped sharing after we finished (not an error: everything we asked for arrived). */
+  hostGone: boolean;
   error: { kind: ReceiveErrorKind; message: string } | null;
+}
+
+/** What {@link Receiver.planDownload} will fetch, and how to save it. */
+export interface DownloadPlan {
+  files: FileMeta[];
+  name: string;
+  /** Exact byte length of the saved file (the zip's, for several files). */
+  size: number;
+  mime: string;
 }
 
 /** Stable per-tab id so the sender can recognise us when we reconnect. */
@@ -50,50 +87,95 @@ function tabClientId(): string {
   }
 }
 
+/** One download: a fixed list of files saved as one file (or one zip). */
+interface Batch {
+  n: number;
+  files: FileMeta[];
+  saveName: string;
+  total: number;
+  incoming: Map<number, IncomingFile>;
+  /** Position of the file whose blocks are arriving. */
+  cursor: number;
+  /** Files completely verified and ended (always a prefix of `files`). */
+  done: number;
+  /** Bytes handed to the sink. */
+  written: number;
+  /** Bytes received for this download (verified, or in blocks still arriving / being checked). */
+  progress: number;
+}
+
+/** A block being assembled from the chunks that follow its header. */
+interface Assembly {
+  /** From a superseded request: its bytes are counted and dropped. */
+  stale: boolean;
+  seq: number;
+  /** Data channel it arrived on (flow-control credit is per channel). */
+  conn: number;
+  pos: number;
+  offset: number;
+  size: number;
+  sha256: string;
+  buf: Uint8Array<ArrayBuffer> | null;
+  filled: number;
+}
+
 /**
- * The receiving side: connects to the sender behind `code`, shows the
- * manifest, and on {@link start} streams every file into the chosen sink,
- * verifying each file's SHA-256 against the digest the sender announces.
- * If the connection drops mid-transfer it reconnects and resumes from the
- * exact byte it stopped at.
+ * The receiving side: connects to the sender behind `code`, shows what's on
+ * offer, and on {@link start} streams the chosen files into a sink.
+ *
+ * Integrity: every block arrives with the SHA-256 the sender computed as it
+ * read the file. A block is checked before any of it is written, so nothing
+ * unverified ever reaches the disk, and a block that fails is simply fetched
+ * again. If the connection drops, the receiver reconnects and resumes from the
+ * last verified block.
  */
 export class Receiver {
-  private readonly signaling: SignalingClient;
+  private readonly signaling: Signaling;
   private readonly clientId = tabClientId();
   private link: PeerLink | null = null;
   private dc: RTCDataChannel | null = null;
-  private hasher: StreamHasher | null = null;
   private readonly meter = new SpeedMeter();
 
   private status: ReceiveStatus = 'connecting';
   private error: ReceiveSnapshot['error'] = null;
-  private files: FileMeta[] | null = null;
-  private totalBytes = 0;
+  private manifest: FileMeta[] | null = null;
+  private readonly downloaded = new Set<number>();
+  private batch: Batch | null = null;
   private sinkKind: SinkKind | null = null;
-  private started = false;
+  private repaired = 0;
+  private hostGone = false;
+  private destroyed = false;
 
-  private readonly incoming = new Map<number, IncomingFile>();
-  /** File currently being received from the network, or -1 between files. */
-  private currentIndex = -1;
-  /** Next file to request once the backlog allows it. */
-  private pendingNext: number | null = null;
-  private received = 0;
-  private consumed = 0;
-  private verified = 0;
+  // Per data channel: flow-control counters and the block being assembled.
+  private conn = 0;
+  private rx = 0;
+  private released = 0;
+  private lastAck = 0;
+  private awaitingManifest = false;
+  private block: Assembly | null = null;
+  /** Current request; blocks from earlier ones are dropped. */
+  private seq = 0;
+  /** Block checks, resolved in arrival order. */
+  private verifying: Promise<void> = Promise.resolve();
+  private readonly retries = new Map<string, number>();
 
   private connectTimer: ReturnType<typeof setTimeout> | undefined;
   private reconnects = 0;
+  /** Bumped by anything that counts as progress: a chunk arriving, a check finishing, a write. */
+  private activity = 0;
+  private watchdog: ReturnType<typeof setInterval> | undefined;
+  private stall = { activity: -1, since: 0, recoveries: 0, written: 0 };
   private emitTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
     readonly code: string,
     private readonly onChange: (snapshot: ReceiveSnapshot) => void,
   ) {
-    this.signaling = new SignalingClient({
+    this.signaling = createSignaling({
       onReady: () => {
         // Only (re)join when we actually need a peer connection: re-joining
         // while the data channel is healthy would make the sender replace it.
-        if (!this.isChannelOpen && !this.isFinal) this.join();
+        if (!this.isChannelOpen && !this.isFinal && !this.hostGone) this.join();
       },
       onMessage: (msg) => this.onSignal(msg),
     });
@@ -104,23 +186,53 @@ export class Receiver {
     this.emit();
   }
 
-  /** Begin downloading into `sink`. */
-  start(sink: Sink): void {
-    if (this.started || !this.files) return;
-    this.started = true;
+  /** The files the download button would fetch now, and the name/size/type to save them under. */
+  planDownload(): DownloadPlan | null {
+    if (this.busy) return null;
+    const files = this.pending();
+    if (files.length === 0) return null;
+    const n = (this.batch?.n ?? 0) + 1;
+    if (files.length === 1) {
+      const f = files[0]!;
+      return { files, name: sanitizeName(f.name), size: f.size, mime: f.type || 'application/octet-stream' };
+    }
+    const names = uniqueNames(files.map((f) => sanitizeName(f.name)));
+    return {
+      files,
+      name: n === 1 ? `pizzadrop-${this.code}.zip` : `pizzadrop-${this.code}-${n}.zip`,
+      size: Number(predictLength(files.map((f, i) => ({ name: names[i]!, size: f.size })))),
+      mime: 'application/zip',
+    };
+  }
+
+  /** Download `plan`'s files into `sink`. False if a download can't start now (the caller should abort the sink). */
+  start(sink: Sink, plan: DownloadPlan): boolean {
+    if (this.busy || this.isFinal || !this.manifest || plan.files.length === 0) return false;
+    const batch: Batch = {
+      n: (this.batch?.n ?? 0) + 1,
+      files: plan.files,
+      saveName: plan.name,
+      total: plan.files.reduce((a, f) => a + f.size, 0),
+      incoming: new Map(),
+      cursor: 0,
+      done: 0,
+      written: 0,
+      progress: 0,
+    };
+    this.batch = batch;
     this.sinkKind = sink.kind;
     this.status = 'receiving';
-    this.hasher = new StreamHasher();
+    this.meter.reset();
 
-    const files = this.files;
     const source =
-      files.length === 1 ? this.file(0).readable : makeZip(this.zipEntries(files), { buffersAreUTF8: true });
+      batch.files.length === 1
+        ? this.file(batch, 0).readable
+        : makeZip(this.zipEntries(batch), { buffersAreUTF8: true });
 
-    this.pendingNext = 0;
-    this.maybeRequestNext();
-
+    this.request(batch);
+    this.watch(batch);
     source.pipeTo(sink.writable).then(
-      () => this.finish(),
+      () => this.finish(batch),
       (err: unknown) => {
         if (this.status === 'error') return;
         const message = err instanceof Error ? err.message : String(err);
@@ -128,43 +240,31 @@ export class Receiver {
       },
     );
     this.emit();
+    return true;
   }
 
   /** Stop the download (the partial file is discarded where the sink allows it). */
   cancel(): void {
-    if (this.isFinal) return;
+    if (this.isFinal || !this.busy) return;
     this.sendControl({ type: 'cancel' });
     this.fail('cancelled', 'Download cancelled.');
   }
 
   /** Tear everything down (component unmount). */
   destroy(): void {
+    this.destroyed = true;
+    clearInterval(this.watchdog);
     clearTimeout(this.connectTimer);
     clearTimeout(this.emitTimer);
     this.signaling.send({ t: 'leave' });
     this.signaling.close();
     this.closeLink();
-    this.hasher?.terminate();
-    for (const f of this.incoming.values()) f.fail(new DOMException('closed', 'AbortError'));
+    this.batch?.incoming.forEach((f) => f.fail(new DOMException('closed', 'AbortError')));
   }
 
-  get saveName(): string | null {
-    if (!this.files) return null;
-    if (this.files.length === 1) return sanitizeName(this.files[0]!.name);
-    return `pizzadrop-${this.code}.zip`;
-  }
-
-  /** Byte length of what will be saved (the zip's exact size for several files). */
-  get saveSize(): number | null {
-    if (!this.files) return null;
-    if (this.files.length === 1) return this.totalBytes;
-    const names = uniqueNames(this.files.map((f) => sanitizeName(f.name)));
-    return Number(predictLength(this.files.map((f, i) => ({ name: names[i]!, size: f.size }))));
-  }
-
-  get saveMime(): string {
-    if (!this.files) return 'application/octet-stream';
-    return this.files.length === 1 ? this.files[0]!.type || 'application/octet-stream' : 'application/zip';
+  /** A download is under way. */
+  private get busy(): boolean {
+    return this.status === 'receiving' || this.status === 'reconnecting' || this.status === 'finishing';
   }
 
   private get isChannelOpen(): boolean {
@@ -172,7 +272,13 @@ export class Receiver {
   }
 
   private get isFinal(): boolean {
-    return this.status === 'done' || this.status === 'error';
+    return this.status === 'error' || this.destroyed;
+  }
+
+  private pending(): FileMeta[] {
+    if (!this.manifest) return [];
+    const inFlight = this.busy && this.batch ? new Set(this.batch.files.map((f) => f.id)) : null;
+    return this.manifest.filter((f) => !this.downloaded.has(f.id) && !inFlight?.has(f.id));
   }
 
   // ─── Signaling / connection ─────────────────────────────────────────────
@@ -182,6 +288,15 @@ export class Receiver {
     clearTimeout(this.connectTimer);
     this.connectTimer = setTimeout(() => {
       if (this.isChannelOpen || this.isFinal) return;
+      if (this.status === 'done') {
+        this.hostGone = true;
+        this.emit();
+        return;
+      }
+      if (!this.signaling.isOpen) {
+        this.fail('network', 'Couldn’t reach the signaling server that introduces you to the sender. Try again soon.');
+        return;
+      }
       this.fail(
         'unreachable',
         "Couldn't connect to the sender directly. One of you may be behind a strict firewall or NAT; the site operator can fix this by adding a TURN server.",
@@ -206,22 +321,24 @@ export class Receiver {
         return;
       case 'error':
         if (msg.code === 'not-found') {
+          if (this.status === 'done') return this.senderGone();
           this.fail(
-            this.started ? 'host-left' : 'not-found',
-            this.started
+            this.batch ? 'host-left' : 'not-found',
+            this.batch
               ? 'The sender closed their tab before the transfer finished.'
               : 'This link has expired or never existed.',
           );
-        } else if (msg.code === 'room-full' || msg.code === 'rate-limited') {
+        } else if (msg.code === 'room-full' || msg.code === 'rate-limited' || msg.code === 'server-error') {
           this.fail('network', msg.message);
         }
         return;
       case 'host-left':
         // If the data channel is still up, let it finish/close on its own.
+        if (this.status === 'done') return this.senderGone();
         if (!this.isChannelOpen) {
           this.fail(
             'host-left',
-            this.started ? 'The sender closed their tab before the transfer finished.' : 'The sender stopped sharing.',
+            this.batch ? 'The sender closed their tab before the transfer finished.' : 'The sender stopped sharing.',
           );
         }
         return;
@@ -230,12 +347,26 @@ export class Receiver {
     }
   }
 
+  private senderGone(): void {
+    clearTimeout(this.connectTimer);
+    this.hostGone = true;
+    this.emit();
+  }
+
   private setupChannel(dc: RTCDataChannel): void {
     dc.binaryType = 'arraybuffer';
+    // A new channel starts a new flow-control account; any half-received block is dropped.
+    this.conn++;
+    this.rx = 0;
+    this.released = 0;
+    this.lastAck = 0;
+    this.block = null;
+    this.awaitingManifest = true;
     dc.onopen = () => {
       clearTimeout(this.connectTimer);
     };
     dc.onmessage = (ev: MessageEvent) => {
+      if (this.isFinal) return;
       if (typeof ev.data === 'string') {
         const msg = parseSenderMessage(ev.data);
         if (msg) this.onControl(msg);
@@ -252,16 +383,18 @@ export class Receiver {
   private onConnectionLost(): void {
     if (this.isFinal) return;
     this.closeLink();
-    if (this.status === 'finishing') return; // every byte is already here
+    if (this.status === 'finishing' || this.hostGone) return; // every byte is already here
     if (++this.reconnects > MAX_RECONNECTS) {
+      if (this.status === 'done') return this.senderGone();
       this.fail('network', 'Lost the connection to the sender and could not get it back.');
       return;
     }
-    this.status = this.started ? 'reconnecting' : 'connecting';
+    if (this.status === 'receiving') this.status = 'reconnecting';
+    else if (this.status === 'ready') this.status = 'connecting';
     this.emit();
     const delay = 500 * this.reconnects;
     setTimeout(() => {
-      if (this.isFinal || this.isChannelOpen) return;
+      if (this.isFinal || this.isChannelOpen || this.hostGone) return;
       if (this.signaling.isOpen) this.join();
       // Otherwise the signaling client is reconnecting and will join in onReady.
     }, delay);
@@ -283,173 +416,327 @@ export class Receiver {
   private onControl(msg: SenderMessage): void {
     switch (msg.type) {
       case 'manifest':
-        return this.onManifest(msg.files);
+        return this.onManifest(msg.version, msg.files);
+      case 'block':
+        return this.onBlock(msg);
       case 'file-end':
-        return this.onFileEnd(msg.index, msg.sha256);
+        return this.onFileEnd(msg.seq, msg.id);
       case 'error':
         return this.fail('sender', msg.message);
     }
   }
 
-  private onManifest(files: FileMeta[]): void {
-    if (this.files) {
-      // Reconnected: make sure it's the same share, then resume where we were.
-      if (!sameManifest(this.files, files)) {
-        this.fail('sender', 'The files being shared changed. Reload to download the new ones.');
-        return;
-      }
-      this.reconnects = 0;
-      if (this.started) {
-        this.status = 'receiving';
-        if (this.currentIndex >= 0) {
-          this.sendControl({
-            type: 'request',
-            index: this.currentIndex,
-            offset: this.file(this.currentIndex).received,
-          });
-        } else {
-          this.maybeRequestNext();
-        }
-      } else {
-        this.status = 'ready';
-      }
-      this.emit();
+  private onManifest(version: number, files: FileMeta[]): void {
+    if (version !== PROTOCOL_VERSION) {
+      this.fail(
+        'sender',
+        'The sender is on a different version of PizzaDrop. Ask them to reload their page and share again.',
+      );
       return;
     }
-    this.files = files;
-    this.totalBytes = files.reduce((a, f) => a + f.size, 0);
-    this.status = 'ready';
+    this.manifest = files;
+    const reconnected = this.awaitingManifest;
+    this.awaitingManifest = false;
+    if (reconnected) {
+      this.reconnects = 0;
+      if (this.status === 'connecting') this.status = 'ready';
+      if (this.busy && this.batch) {
+        // Back after a drop: make sure it's the same share, then resume from the last verified block.
+        const offered = new Map(files.map((f) => [f.id, f]));
+        const same = this.batch.files.every((f) => {
+          const o = offered.get(f.id);
+          return o && o.name === f.name && o.size === f.size;
+        });
+        if (!same) {
+          this.fail('sender', 'The files being shared changed. Reload to download the new ones.');
+          return;
+        }
+        if (this.status === 'reconnecting') this.status = 'receiving';
+        this.request(this.batch);
+      }
+    }
     this.emit();
   }
 
-  private onChunk(buf: ArrayBuffer): void {
-    if (!this.started || !this.files || this.currentIndex < 0 || this.isFinal) return;
-    const meta = this.files[this.currentIndex]!;
-    const file = this.file(this.currentIndex);
-    if (file.received + buf.byteLength > meta.size) {
-      this.fail('sender', 'The sender sent more data than announced.');
-      return;
+  /** (Re)request the batch from its first unverified byte, superseding any earlier request. */
+  private request(batch: Batch): void {
+    this.seq++;
+    const a = this.block;
+    if (a && !a.stale) {
+      this.releaseFrom(a.conn, a.filled);
+      a.stale = true;
+      a.buf = null;
     }
-    file.received += buf.byteLength;
-    this.received += buf.byteLength;
-    this.hasher!.update(buf);
-    file.push(new Uint8Array(buf));
-    this.meter.push(this.received);
-    this.emitSoon();
+    const pos = batch.done;
+    for (const [p, f] of batch.incoming) if (p >= pos) f.assembled = f.verified;
+    batch.cursor = pos;
+    const resumeAt = batch.incoming.get(pos)?.verified ?? 0;
+    batch.progress = batch.files.slice(0, pos).reduce((a, f) => a + f.size, 0) + resumeAt;
+    this.meter.reset();
+    if (pos >= batch.files.length) return;
+    this.sendControl({
+      type: 'request',
+      seq: this.seq,
+      files: batch.files.slice(pos).map((f) => f.id),
+      offset: resumeAt,
+      written: batch.written,
+      total: batch.total,
+    });
   }
 
-  private onFileEnd(index: number, expected: string): void {
-    if (!this.files || index !== this.currentIndex) {
+  private onBlock(msg: Extract<SenderMessage, { type: 'block' }>): void {
+    const prev = this.block;
+    if (prev && !prev.stale) {
+      this.fail('sender', 'The sender started a new block before finishing the last one.');
+      return;
+    }
+    const batch = this.batch;
+    if (!batch || msg.seq !== this.seq || !this.busy) {
+      // Answer to a request we've since replaced: count its bytes as they arrive and drop them.
+      this.block = { ...msg, stale: true, conn: this.conn, pos: -1, buf: null, filled: 0 };
+      return;
+    }
+    const pos = batch.cursor;
+    const meta = batch.files[pos];
+    const file = this.file(batch, pos);
+    if (!meta || msg.id !== meta.id) {
       this.fail('sender', 'The sender sent files out of order.');
       return;
     }
-    const meta = this.files[index]!;
-    const file = this.file(index);
-    if (file.received !== meta.size) {
+    if (msg.offset !== file.assembled || msg.offset + msg.size > meta.size) {
+      this.fail('sender', 'The sender sent a block out of order.');
+      return;
+    }
+    file.assembled += msg.size;
+    this.block = { ...msg, stale: false, conn: this.conn, pos, buf: new Uint8Array(msg.size), filled: 0 };
+  }
+
+  private onChunk(buf: ArrayBuffer): void {
+    const n = buf.byteLength;
+    this.rx += n;
+    this.activity++;
+    const a = this.block;
+    if (!a) {
+      this.fail('sender', 'The sender sent data it hadn’t announced.');
+      return;
+    }
+    if (a.filled + n > a.size) {
+      this.fail('sender', 'The sender sent more data than announced.');
+      return;
+    }
+    a.filled += n;
+    if (a.stale || !a.buf) {
+      this.release(n);
+    } else {
+      a.buf.set(new Uint8Array(buf), a.filled - n);
+      this.batch!.progress += n;
+      this.meter.push(this.batch!.progress);
+      this.emitSoon();
+    }
+    if (a.filled === a.size) {
+      this.block = null;
+      if (!a.stale) this.check(a);
+    }
+  }
+
+  /** Verify a complete block, then hand it to the sink — in arrival order, while later blocks keep arriving. */
+  private check(a: Assembly): void {
+    const batch = this.batch!;
+    const bytes = a.buf!;
+    const digest = sha256Hex(bytes);
+    digest.catch(() => undefined);
+    this.afterChecks(async () => {
+      const actual = await digest;
+      if (this.isFinal) return;
+      if (a.seq !== this.seq || this.batch !== batch) {
+        this.releaseFrom(a.conn, a.size);
+        return;
+      }
+      if (actual !== a.sha256) {
+        this.releaseFrom(a.conn, a.size);
+        this.onBadBlock(batch, a);
+        return;
+      }
+      this.activity++;
+      const file = this.file(batch, a.pos);
+      file.verified += a.size;
+      file.push(bytes, a.conn);
+    });
+  }
+
+  private onBadBlock(batch: Batch, a: Assembly): void {
+    const meta = batch.files[a.pos]!;
+    const key = `${batch.n}:${a.pos}:${a.offset}`;
+    const tries = (this.retries.get(key) ?? 0) + 1;
+    this.retries.set(key, tries);
+    if (tries > MAX_BLOCK_RETRIES) {
+      this.fail(
+        'integrity',
+        `"${meta.name}" kept failing its integrity check (SHA-256 mismatch), so the download was stopped and discarded.`,
+      );
+      return;
+    }
+    this.repaired++;
+    console.warn(`[receiver] block at ${a.offset} of "${meta.name}" failed its SHA-256 check; fetching it again`);
+    this.request(batch);
+    this.emit();
+  }
+
+  private onFileEnd(seq: number, id: number): void {
+    const batch = this.batch;
+    if (!batch || seq !== this.seq || !this.busy) return; // from a superseded request
+    if (this.block && !this.block.stale) {
+      this.fail('sender', 'The sender ended a file in the middle of a block.');
+      return;
+    }
+    this.block = null;
+    const pos = batch.cursor;
+    const meta = batch.files[pos];
+    if (!meta || meta.id !== id) {
+      this.fail('sender', 'The sender sent files out of order.');
+      return;
+    }
+    const file = this.file(batch, pos);
+    if (file.assembled !== meta.size) {
       this.fail('integrity', `"${meta.name}" arrived with the wrong size.`);
       return;
     }
-    // digest() is queued behind every update() for this file, so posting it
-    // now (before any bytes of the next file) keeps the hashes separate.
-    const digest = this.hasher!.digest();
-    this.currentIndex = -1;
-    this.pendingNext = index + 1 < this.files.length ? index + 1 : null;
-
-    digest.then(
-      (actual) => {
-        if (this.isFinal) return;
-        if (actual !== expected) {
-          this.fail(
-            'integrity',
-            `"${meta.name}" failed its integrity check (SHA-256 mismatch). The download was discarded.`,
-          );
-          return;
-        }
-        this.verified++;
-        file.end();
-        if (this.verified === this.files!.length) {
-          this.status = 'finishing';
-          this.emit();
-        }
-      },
-      (err: unknown) => this.fail('integrity', `Couldn't verify "${meta.name}": ${String(err)}`),
-    );
-    this.maybeRequestNext();
+    batch.cursor++;
+    this.afterChecks(() => {
+      // A failed block in this file restarts the request, and this end is then moot.
+      if (this.isFinal || seq !== this.seq || this.batch !== batch) return;
+      file.end();
+      batch.done++;
+      if (batch.done === batch.files.length) {
+        this.status = 'finishing';
+        this.emit();
+      }
+    });
   }
 
-  /** Ask for the next file, unless too many received bytes are still waiting to be written. */
-  private maybeRequestNext(): void {
-    if (this.pendingNext === null || !this.isChannelOpen || this.isFinal) return;
-    if (this.received - this.consumed > WINDOW / 2) return;
-    const index = this.pendingNext;
-    this.pendingNext = null;
-    this.currentIndex = index;
-    this.sendControl({ type: 'request', index, offset: this.file(index).received });
+  /** Watch a download for stalls (see {@link STALL_MS}). */
+  private watch(batch: Batch): void {
+    clearInterval(this.watchdog);
+    this.stall = { activity: -1, since: 0, recoveries: 0, written: batch.written };
+    this.watchdog = setInterval(() => this.checkStall(batch), STALL_MS / 4);
   }
 
-  private onConsumed(index: number, file: IncomingFile, bytes: number): void {
-    this.consumed += bytes;
-    const size = this.files?.[index]?.size ?? 0;
-    if (index === this.currentIndex && (file.consumed - file.lastAck >= ACK_EVERY || file.consumed === size)) {
-      file.lastAck = file.consumed;
-      this.sendControl({ type: 'ack', index, bytes: file.consumed });
+  private checkStall(batch: Batch): void {
+    const now = performance.now();
+    const s = this.stall;
+    // Only a download that should be flowing counts: not while reconnecting, not once every byte is in.
+    if (this.status !== 'receiving' || this.batch !== batch || !this.isChannelOpen || s.activity !== this.activity) {
+      s.activity = this.activity;
+      s.since = now;
+      return;
     }
-    this.maybeRequestNext();
+    if (now - s.since < STALL_MS) return;
+    if (batch.written > s.written) {
+      s.written = batch.written;
+      s.recoveries = 0;
+    }
+    if (++s.recoveries > MAX_STALL_RECOVERIES) {
+      this.fail('network', 'The download stopped making progress. Try again.');
+      return;
+    }
+    console.warn(
+      `[receiver] no progress for ${STALL_MS / 1000} s; reconnecting to resume from the last verified block`,
+    );
+    s.activity = -1;
+    // Start the checks afresh: whatever was pending belongs to the old request and is dropped when it settles.
+    this.verifying = Promise.resolve();
+    this.onConnectionLost();
+  }
+
+  /**
+   * Run `step` after every earlier check, in arrival order. An exception becomes a visible error: left alone, one
+   * rejected step would silently skip every later one and stall the download.
+   */
+  private afterChecks(step: () => void | Promise<void>): void {
+    this.verifying = this.verifying.then(step).catch((err: unknown) => {
+      console.error('[receiver] block check failed', err);
+      this.fail('integrity', `Couldn't check the download: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }
+
+  /** Count `n` bytes of channel `conn` as finished with (written or dropped), and ack when due. */
+  private releaseFrom(conn: number, n: number): void {
+    if (conn === this.conn) this.release(n);
+  }
+
+  private release(n: number): void {
+    this.released += n;
+    if (this.released - this.lastAck >= ACK_EVERY || this.released === this.rx) {
+      this.lastAck = this.released;
+      this.sendControl({
+        type: 'ack',
+        bytes: this.released,
+        written: this.batch?.written ?? 0,
+        total: this.batch?.total ?? 0,
+      });
+    }
   }
 
   private sendControl(msg: ReceiverMessage): void {
-    if (this.dc?.readyState === 'open') this.dc.send(JSON.stringify(msg));
+    const dc = this.dc;
+    if (dc?.readyState !== 'open') return;
+    try {
+      dc.send(JSON.stringify(msg));
+    } catch (err) {
+      // The channel is going away (its state lags behind); reconnecting takes it from here.
+      console.warn('[receiver] could not send', msg.type, err);
+    }
   }
 
   // ─── Files / sink ───────────────────────────────────────────────────────
 
-  private file(index: number): IncomingFile {
-    let f = this.incoming.get(index);
+  private file(batch: Batch, pos: number): IncomingFile {
+    let f = batch.incoming.get(pos);
     if (!f) {
-      const created = new IncomingFile((n) => this.onConsumed(index, created, n));
-      this.incoming.set(index, created);
-      f = created;
+      f = new IncomingFile((bytes, conn) => {
+        batch.written += bytes;
+        this.activity++;
+        this.releaseFrom(conn, bytes);
+      });
+      batch.incoming.set(pos, f);
     }
     return f;
   }
 
-  private async *zipEntries(files: FileMeta[]) {
-    const names = uniqueNames(files.map((f) => sanitizeName(f.name)));
-    for (let i = 0; i < files.length; i++) {
-      const meta = files[i]!;
+  private async *zipEntries(batch: Batch) {
+    const names = uniqueNames(batch.files.map((f) => sanitizeName(f.name)));
+    for (let i = 0; i < batch.files.length; i++) {
+      const meta = batch.files[i]!;
       yield {
         name: names[i]!,
         size: meta.size,
         lastModified: new Date(meta.lastModified),
-        input: this.file(i).readable,
+        input: this.file(batch, i).readable,
       };
       // Resumed only once file i has been fully zipped: release it so memory
       // stays flat even with thousands of files.
-      this.incoming.delete(i);
+      batch.incoming.delete(i);
     }
   }
 
-  private finish(): void {
-    if (this.isFinal) return;
+  private finish(batch: Batch): void {
+    if (this.isFinal || this.batch !== batch) return;
+    clearInterval(this.watchdog);
+    for (const f of batch.files) this.downloaded.add(f.id);
     this.status = 'done';
+    // Stay connected: the sender may add more files later.
     this.sendControl({ type: 'done' });
     this.emit();
-    // Let the 'done' message flush before tearing the connection down.
-    setTimeout(() => {
-      this.signaling.send({ t: 'leave' });
-      this.signaling.close();
-      this.closeLink();
-      this.hasher?.terminate();
-    }, 1000);
   }
 
   private fail(kind: ReceiveErrorKind, message: string): void {
     if (this.isFinal) return;
+    clearInterval(this.watchdog);
     this.status = 'error';
     this.error = { kind, message };
     clearTimeout(this.connectTimer);
     const reason = new Error(message);
-    for (const f of this.incoming.values()) f.fail(reason);
+    this.batch?.incoming.forEach((f) => f.fail(reason));
     this.emit();
     if (kind !== 'save' && kind !== 'integrity') return;
     this.sendControl({ type: 'cancel' });
@@ -467,38 +754,50 @@ export class Receiver {
 
   private emit(): void {
     const active = this.status === 'receiving';
+    const batch = this.batch;
+    const pending = this.pending();
     this.onChange({
       status: this.status,
-      files: this.files,
-      saveName: this.saveName,
-      totalBytes: this.totalBytes,
-      bytes: this.received,
+      files: this.manifest,
+      pending,
+      pendingBytes: pending.reduce((a, f) => a + f.size, 0),
+      downloadedCount: this.downloaded.size,
+      batch: batch && {
+        n: batch.n,
+        files: batch.files,
+        saveName: batch.saveName,
+        total: batch.total,
+        bytes: batch.progress,
+        fileIndex: Math.min(batch.cursor, batch.files.length - 1),
+        verified: batch.done,
+      },
       speed: active ? this.meter.bytesPerSecond : 0,
-      eta: active ? this.meter.eta(this.totalBytes) : Infinity,
-      fileIndex: Math.max(0, this.currentIndex),
-      verified: this.verified,
+      eta: active && batch ? this.meter.eta(batch.total) : Infinity,
       sinkKind: this.sinkKind,
+      repaired: this.repaired,
+      hostGone: this.hostGone,
       error: this.error,
     });
   }
 }
 
 /**
- * One incoming file as a pull-based ReadableStream: chunks are handed to the
- * sink only when it asks for more, and each hand-off is reported so the sender
- * can be acknowledged (end-to-end flow control).
+ * One incoming file as a pull-based ReadableStream of verified blocks: a
+ * block is handed to the sink only when it asks for more, and each hand-off is
+ * reported so the sender can be acknowledged (end-to-end flow control).
  */
 class IncomingFile {
-  received = 0;
-  consumed = 0;
-  lastAck = 0;
-  private queue: Uint8Array[] = [];
+  /** Bytes announced and accepted for this file (including blocks still arriving or being checked). */
+  assembled = 0;
+  /** Bytes that passed their check. */
+  verified = 0;
+  private queue: Array<{ bytes: Uint8Array; conn: number }> = [];
   private ended = false;
   private error: Error | null = null;
   private readonly changed = new Notifier();
   readonly readable: ReadableStream<Uint8Array>;
 
-  constructor(onConsumed: (bytes: number) => void) {
+  constructor(onConsumed: (bytes: number, conn: number) => void) {
     this.readable = new ReadableStream<Uint8Array>(
       {
         pull: async (controller) => {
@@ -507,11 +806,10 @@ class IncomingFile {
             controller.error(this.error);
             return;
           }
-          const chunk = this.queue.shift();
-          if (chunk) {
-            controller.enqueue(chunk);
-            this.consumed += chunk.byteLength;
-            onConsumed(chunk.byteLength);
+          const item = this.queue.shift();
+          if (item) {
+            controller.enqueue(item.bytes);
+            onConsumed(item.bytes.byteLength, item.conn);
             return;
           }
           controller.close();
@@ -524,8 +822,8 @@ class IncomingFile {
     );
   }
 
-  push(chunk: Uint8Array): void {
-    this.queue.push(chunk);
+  push(bytes: Uint8Array, conn: number): void {
+    this.queue.push({ bytes, conn });
     this.changed.notify();
   }
 
@@ -540,8 +838,4 @@ class IncomingFile {
     this.queue = [];
     this.changed.notify();
   }
-}
-
-function sameManifest(a: FileMeta[], b: FileMeta[]): boolean {
-  return a.length === b.length && a.every((f, i) => f.name === b[i]!.name && f.size === b[i]!.size);
 }

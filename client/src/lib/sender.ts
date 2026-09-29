@@ -8,11 +8,12 @@ import {
   type ServerMessage,
   type SignalPayload,
 } from '@pizzadrop/shared';
-import { CHUNK_SIZE, CONNECT_TIMEOUT_MS, HIGH_WATER, LOW_WATER, READ_SIZE, WINDOW } from './constants';
-import { ChannelClosedError, Notifier, streamBlob } from './flow';
-import { FileHasher } from './hasher';
+import { shareUrl } from './config';
+import { BLOCK_SIZE, CHUNK_SIZE, CONNECT_TIMEOUT_MS, HIGH_WATER, LOW_WATER, WINDOW } from './constants';
+import { sha256Hex } from './digest';
+import { ChannelClosedError, Notifier, streamBlob, type Credit } from './flow';
 import { PeerLink } from './rtc';
-import { SignalingClient } from './signaling';
+import { createSignaling, type Signaling } from './signaling';
 import { SpeedMeter } from './speed';
 
 export type ReceiverStatus = 'connecting' | 'connected' | 'receiving' | 'done' | 'disconnected' | 'failed';
@@ -22,12 +23,12 @@ export interface ReceiverSnapshot {
   /** 1-based, for "Receiver 2" labels. */
   n: number;
   status: ReceiverStatus;
-  /** Bytes the receiver has confirmed writing, across all files. */
+  /** Bytes of the receiver's current download written to their disk. */
   bytes: number;
+  /** Size of the receiver's current download (0 until they start one). */
   total: number;
   speed: number;
   eta: number;
-  fileIndex: number;
   error: string | null;
 }
 
@@ -37,9 +38,9 @@ export interface HostSnapshot {
   status: HostStatus;
   code: string | null;
   url: string | null;
+  /** Files currently on offer, oldest first. */
   files: FileMeta[];
   totalBytes: number;
-  hashedBytes: number;
   receivers: ReceiverSnapshot[];
   error: string | null;
 }
@@ -49,24 +50,28 @@ interface Row {
   n: number;
   status: ReceiverStatus;
   bytes: number;
-  fileIndex: number;
+  total: number;
   error: string | null;
   meter: SpeedMeter;
   link: Outgoing | null;
+}
+
+interface Entry {
+  file: File;
+  meta: FileMeta;
+  removed: boolean;
 }
 
 /**
  * The sending side. Registers a share code with the signaling server, then
  * opens one RTCPeerConnection per receiver and streams the requested files to
  * each of them independently — a receiver dropping out never affects others.
+ * Files can be added to (and removed from) the share while it is live.
  */
 export class Host {
-  private readonly signaling: SignalingClient;
-  readonly hasher: FileHasher;
-  readonly meta: FileMeta[];
-  /** prefix[i] = total size of files before i. */
-  private readonly prefix: number[];
-  readonly totalBytes: number;
+  private readonly signaling: Signaling;
+  /** Every file ever shared, indexed by id. Removed files stay, flagged, so ids are never reused. */
+  private readonly entries: Entry[] = [];
 
   private readonly rows = new Map<string, Row>();
   private readonly links = new Map<string, Outgoing>();
@@ -76,36 +81,19 @@ export class Host {
   private token: string | null = null;
   private status: HostStatus = 'connecting';
   private error: string | null = null;
-  private hashedBytes = 0;
   private emitTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
-    readonly files: readonly File[],
+    files: readonly File[],
     private readonly onChange: (snapshot: HostSnapshot) => void,
   ) {
-    this.meta = files.map((f) => ({
-      name: f.name || 'file',
-      size: f.size,
-      type: f.type,
-      lastModified: Number.isSafeInteger(f.lastModified) && f.lastModified >= 0 ? f.lastModified : Date.now(),
-    }));
-    this.prefix = [];
-    let acc = 0;
-    for (const f of files) {
-      this.prefix.push(acc);
-      acc += f.size;
-    }
-    this.totalBytes = acc;
-
-    this.hasher = new FileHasher(files, (bytes) => {
-      this.hashedBytes = bytes;
-      this.emitSoon();
-    });
-
-    this.signaling = new SignalingClient({
+    this.append(files);
+    this.signaling = createSignaling({
       onReady: () => {
         this.signaling.send(
-          this.code && this.token ? { t: 'host', resume: { code: this.code, token: this.token } } : { t: 'host' },
+          this.code && this.token !== null
+            ? { t: 'host', resume: { code: this.code, token: this.token } }
+            : { t: 'host' },
         );
       },
       onMessage: (msg) => this.onSignal(msg),
@@ -130,8 +118,28 @@ export class Host {
     this.signaling.close();
     for (const link of this.links.values()) link.close();
     this.links.clear();
-    this.hasher.terminate();
     this.status = 'stopped';
+    this.emit();
+  }
+
+  /** Offer more files. Receivers see them straight away; those who already downloaded can fetch just the new ones. */
+  addFiles(files: readonly File[]): void {
+    if (files.length === 0 || this.status === 'stopped') return;
+    this.append(files);
+    this.broadcastManifest();
+    this.emit();
+  }
+
+  /**
+   * Stop offering a file. It disappears from every receiver's list, and a download that still needs it is stopped:
+   * a removed file is never sent again. The last file can't be removed (stop sharing instead).
+   */
+  removeFile(id: number): void {
+    const entry = this.entries[id];
+    if (!entry || entry.removed || this.manifest().length <= 1) return;
+    entry.removed = true;
+    for (const link of this.links.values()) link.fileRemoved(id);
+    this.broadcastManifest();
     this.emit();
   }
 
@@ -141,8 +149,35 @@ export class Host {
     return false;
   }
 
-  bytesBefore(index: number): number {
-    return this.prefix[index] ?? 0;
+  /** The files on offer, in the order they were added. */
+  manifest(): FileMeta[] {
+    return this.entries.filter((e) => !e.removed).map((e) => e.meta);
+  }
+
+  entry(id: number): Entry | undefined {
+    return this.entries[id];
+  }
+
+  private append(files: readonly File[]): void {
+    for (const file of files) {
+      const id = this.entries.length;
+      this.entries.push({
+        file,
+        removed: false,
+        meta: {
+          id,
+          name: file.name || 'file',
+          size: file.size,
+          type: file.type,
+          lastModified:
+            Number.isSafeInteger(file.lastModified) && file.lastModified >= 0 ? file.lastModified : Date.now(),
+        },
+      });
+    }
+  }
+
+  private broadcastManifest(): void {
+    for (const link of this.links.values()) link.sendManifest();
   }
 
   // ─── Signaling ───────────────────────────────────────────────────────────
@@ -209,7 +244,7 @@ export class Host {
         n: ++this.rowCounter,
         status: 'connecting',
         bytes: 0,
-        fileIndex: 0,
+        total: 0,
         error: null,
         meter: new SpeedMeter(),
         link: null,
@@ -240,25 +275,23 @@ export class Host {
   }
 
   emit(): void {
-    const origin = this.signaling.publicUrl ?? location.origin;
+    const files = this.manifest();
     const receivers = [...this.rows.values()].map<ReceiverSnapshot>((r) => ({
       id: r.id,
       n: r.n,
       status: r.status,
       bytes: r.bytes,
-      total: this.totalBytes,
+      total: r.total,
       speed: r.status === 'receiving' ? r.meter.bytesPerSecond : 0,
-      eta: r.status === 'receiving' ? r.meter.eta(this.totalBytes) : Infinity,
-      fileIndex: r.fileIndex,
+      eta: r.status === 'receiving' ? r.meter.eta(r.total) : Infinity,
       error: r.error,
     }));
     this.onChange({
       status: this.status,
       code: this.code,
-      url: this.code ? `${origin}/${this.code}` : null,
-      files: this.meta,
-      totalBytes: this.totalBytes,
-      hashedBytes: this.hashedBytes,
+      url: this.code ? shareUrl(this.code, this.signaling.publicUrl) : null,
+      files,
+      totalBytes: files.reduce((a, f) => a + f.size, 0),
       receivers,
       error: this.error,
     });
@@ -270,9 +303,11 @@ class Outgoing {
   private readonly link: PeerLink;
   private dc: RTCDataChannel | null = null;
   private readonly changed = new Notifier();
-  private acked = 0;
-  private index = -1;
+  /** Flow control for everything sent on this channel, across files and requests. */
+  private readonly credit: Credit = { sent: 0, acked: 0 };
   private abort: AbortController | null = null;
+  /** The request being served: its files, and which of them is being sent now. */
+  private serving: { seq: number; files: number[]; index: number } | null = null;
   private connectTimer: ReturnType<typeof setTimeout> | undefined;
   private closed = false;
   connected = false;
@@ -298,7 +333,7 @@ class Outgoing {
       clearTimeout(this.connectTimer);
       this.connected = true;
       if (this.row.status !== 'done') this.setStatus('connected');
-      this.sendControl({ type: 'manifest', version: PROTOCOL_VERSION, files: this.host.meta });
+      this.sendManifest();
     };
     dc.onbufferedamountlow = () => this.changed.notify();
     dc.onmessage = (ev: MessageEvent) => {
@@ -322,82 +357,134 @@ class Outgoing {
     return this.link.handleSignal(data).catch((err: unknown) => console.warn('[sender] signal error', err));
   }
 
+  sendManifest(): void {
+    this.sendControl({ type: 'manifest', version: PROTOCOL_VERSION, files: this.host.manifest() });
+  }
+
+  /** The sender removed file `id`: if this receiver's download still needs it, stop the download. */
+  fileRemoved(id: number): void {
+    const s = this.serving;
+    if (!s || s.files.indexOf(id, s.index) === -1) return;
+    this.refuse(`"${this.host.entry(id)?.meta.name}" was removed by the sender, so this download can't finish.`);
+  }
+
   private onMessage(msg: ReceiverMessage): void {
     switch (msg.type) {
       case 'request':
-        void this.sendFile(msg.index, msg.offset);
+        void this.serve(msg);
         return;
       case 'ack':
-        if (msg.index !== this.index) return;
-        this.acked = msg.bytes;
-        this.setBytes(this.host.bytesBefore(msg.index) + msg.bytes);
+        this.credit.acked = Math.max(this.credit.acked, msg.bytes);
+        this.setProgress(msg.written, msg.total);
         this.changed.notify();
         return;
       case 'done':
-        this.abort?.abort();
-        this.setBytes(this.host.totalBytes);
+        this.setProgress(this.row.total, this.row.total);
         this.setStatus('done');
         return;
       case 'cancel':
-        this.abort?.abort();
+        this.stopServing();
         this.setStatus('disconnected');
         this.row.error = 'The receiver cancelled the download.';
         return;
     }
   }
 
-  private async sendFile(index: number, offset: number): Promise<void> {
-    const file = this.host.files[index];
+  /** Stream the requested files back to back, each block announced with its SHA-256. */
+  private async serve(req: Extract<ReceiverMessage, { type: 'request' }>): Promise<void> {
     const dc = this.dc;
-    if (!file || !dc || offset > file.size) {
-      this.sendControl({ type: 'error', message: 'Invalid file request.' });
-      return;
-    }
+    if (!dc) return;
 
     // Only one send loop per receiver. The previous one checks its signal
     // synchronously before every send(), so aborting it here is enough.
-    this.abort?.abort();
+    this.stopServing();
     const ac = new AbortController();
     this.abort = ac;
 
-    this.index = index;
-    this.acked = offset;
-    this.row.fileIndex = index;
-    this.setBytes(this.host.bytesBefore(index) + offset, true);
+    const entries = req.files.map((id) => this.host.entry(id));
+    const first = entries[0];
+    if (
+      !first ||
+      entries.some((e) => !e) ||
+      req.offset > first.file.size ||
+      (req.offset % BLOCK_SIZE !== 0 && req.offset !== first.file.size)
+    ) {
+      this.sendControl({ type: 'error', message: 'Invalid file request.' });
+      return;
+    }
+    const removed = entries.find((e) => e!.removed);
+    if (removed) {
+      this.refuse(`"${removed.meta.name}" was removed by the sender, so this download can't finish.`);
+      return;
+    }
+
+    const serving = { seq: req.seq, files: req.files, index: 0 };
+    this.serving = serving;
+    this.setProgress(req.written, req.total, true);
     this.setStatus('receiving');
 
     const maxMessage = this.link.pc.sctp?.maxMessageSize ?? 0;
     const chunkSize = maxMessage > 0 ? Math.min(CHUNK_SIZE, maxMessage) : CHUNK_SIZE;
 
-    try {
-      await streamBlob({
-        source: file,
-        channel: dc,
-        offset,
-        chunkSize,
-        readSize: READ_SIZE,
-        highWater: HIGH_WATER,
-        window: WINDOW,
-        acked: () => this.acked,
-        changed: this.changed,
-        signal: ac.signal,
-      });
-      const sha256 = await abortable(this.host.hasher.digest(index), ac.signal);
+    for (let i = 0; i < entries.length; i++) {
+      const { file, meta } = entries[i]!;
+      serving.index = i;
+      try {
+        await streamBlob({
+          source: file,
+          channel: dc,
+          offset: i === 0 ? req.offset : 0,
+          blockSize: BLOCK_SIZE,
+          chunkSize,
+          highWater: HIGH_WATER,
+          window: WINDOW,
+          credit: this.credit,
+          changed: this.changed,
+          signal: ac.signal,
+          digest: sha256Hex,
+          onBlock: (b) => this.sendControl({ type: 'block', seq: req.seq, id: meta.id, ...b }),
+        });
+      } catch (err) {
+        if (ac.signal.aborted || err instanceof ChannelClosedError || this.closed) return;
+        console.error('[sender] read error', err);
+        this.sendControl({
+          type: 'error',
+          message: `The sender couldn't read "${meta.name}". It may have been moved, changed or deleted.`,
+        });
+        this.fail(`Couldn't read "${meta.name}" from disk.`);
+        return;
+      }
       if (ac.signal.aborted || dc.readyState !== 'open') return;
-      this.sendControl({ type: 'file-end', index, sha256 });
-    } catch (err) {
-      if (ac.signal.aborted || err instanceof ChannelClosedError || this.closed) return;
-      console.error('[sender] read error', err);
-      this.sendControl({
-        type: 'error',
-        message: `The sender couldn't read "${file.name}". It may have been moved, changed or deleted.`,
-      });
-      this.fail(`Couldn't read "${file.name}" from disk.`);
+      this.sendControl({ type: 'file-end', seq: req.seq, id: meta.id });
+    }
+    if (this.serving === serving) this.serving = null;
+  }
+
+  private stopServing(): void {
+    this.abort?.abort();
+    this.abort = null;
+    this.serving = null;
+  }
+
+  /** Stop the current download and tell the receiver why. */
+  private refuse(message: string): void {
+    this.stopServing();
+    this.sendControl({ type: 'error', message });
+    if (this.row.link === this) {
+      this.row.error = message;
+      this.setStatus('failed');
     }
   }
 
   private sendControl(msg: SenderMessage): void {
-    if (this.dc?.readyState === 'open') this.dc.send(JSON.stringify(msg));
+    const dc = this.dc;
+    if (dc?.readyState !== 'open') return;
+    try {
+      dc.send(JSON.stringify(msg));
+    } catch (err) {
+      // The channel is going away (its state lags behind); the receiver reconnects and re-requests.
+      console.warn('[sender] could not send', msg.type, err);
+    }
   }
 
   private setStatus(status: ReceiverStatus): void {
@@ -409,11 +496,12 @@ class Outgoing {
   /**
    * Update the row's progress. Acks only ever move it forward (after a resume
    * they can briefly trail the resume offset); a new request (`rebase`) sets
-   * it outright, e.g. when the same receiver downloads a second time.
+   * it outright, e.g. when the same receiver starts a second download.
    */
-  private setBytes(bytes: number, rebase = false): void {
+  private setProgress(bytes: number, total: number, rebase = false): void {
     if (this.row.link !== this) return;
-    if (rebase && bytes < this.row.bytes) this.row.meter.reset();
+    if (rebase && (bytes < this.row.bytes || total !== this.row.total)) this.row.meter.reset();
+    this.row.total = total;
     this.row.bytes = rebase ? bytes : Math.max(this.row.bytes, bytes);
     this.row.meter.push(this.row.bytes);
     this.host.emitSoon();
@@ -432,7 +520,7 @@ class Outgoing {
     if (this.closed) return;
     this.closed = true;
     clearTimeout(this.connectTimer);
-    this.abort?.abort();
+    this.stopServing();
     this.changed.notify();
     if (this.dc) {
       this.dc.onclose = null;
@@ -446,22 +534,4 @@ class Outgoing {
     }
     this.onClosed?.();
   }
-}
-
-function abortable<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) return Promise.reject(signal.reason);
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = () => reject(signal.reason);
-    signal.addEventListener('abort', onAbort, { once: true });
-    p.then(
-      (v) => {
-        signal.removeEventListener('abort', onAbort);
-        resolve(v);
-      },
-      (e: unknown) => {
-        signal.removeEventListener('abort', onAbort);
-        reject(e instanceof Error ? e : new Error(String(e)));
-      },
-    );
-  });
 }

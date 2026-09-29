@@ -43,28 +43,45 @@ export interface SourceLike {
 }
 
 export class ChannelClosedError extends Error {
-  constructor() {
-    super('data channel closed');
+  constructor(cause?: unknown) {
+    super('data channel closed', { cause });
     this.name = 'ChannelClosedError';
   }
+}
+
+/** Connection-wide flow-control counters, shared by every file sent over one data channel. */
+export interface Credit {
+  /** Binary bytes handed to `send()` on this channel. */
+  sent: number;
+  /** Binary bytes the receiver says it has finished with (written to disk or discarded). */
+  acked: number;
+}
+
+export interface BlockInfo {
+  offset: number;
+  size: number;
+  sha256: string;
 }
 
 export interface StreamOptions {
   source: SourceLike;
   channel: ChannelLike;
-  /** First byte to send (non-zero when a receiver resumes). */
+  /** First byte to send: 0, a multiple of `blockSize` (a receiver resuming), or the file size (nothing left). */
   offset: number;
+  blockSize: number;
   chunkSize: number;
-  readSize: number;
   /** Pause while `channel.bufferedAmount` exceeds this. */
   highWater: number;
-  /** Pause while more than this many bytes are sent but not yet acknowledged. */
+  /** Pause while `credit.sent - credit.acked` reaches this. */
   window: number;
-  /** Bytes of this file the receiver has acknowledged (absolute offset). */
-  acked: () => number;
+  credit: Credit;
   /** Notified on `bufferedamountlow`, on every ack, and on close/abort. */
   changed: Notifier;
   signal: AbortSignal;
+  /** Hex SHA-256 of one block. */
+  digest(data: Uint8Array<ArrayBuffer>): Promise<string>;
+  /** Announce a block. Called just before its bytes are sent. */
+  onBlock(block: BlockInfo): void;
   /** Called after each chunk is handed to the channel with the new absolute position. */
   onSent?: (position: number) => void;
   /** Fallback poll interval in case an event is missed. */
@@ -72,51 +89,75 @@ export interface StreamOptions {
 }
 
 /**
- * Send `source[offset..size)` as `chunkSize` messages.
+ * Send `source[offset..size)` as blocks: for each block, {@link StreamOptions.onBlock} announces its offset, size and
+ * SHA-256, then its bytes follow as `chunkSize` messages.
  *
- * - Never reads more than two `readSize` blocks into memory (current + prefetch).
+ * - Reads and hashes the next block while the current one is being sent, so the disk, the hash and the network all
+ *   stay busy. At most two blocks are in memory at once.
  * - Never lets `bufferedAmount` exceed `highWater + chunkSize`.
- * - Never gets more than `window + chunkSize` bytes ahead of the receiver's acks.
+ * - Never lets `credit.sent - credit.acked` exceed `window + chunkSize`.
  *
- * Rejects with {@link ChannelClosedError} if the channel closes, with the
- * signal's reason if aborted, or with the read error if the file can't be read.
+ * Rejects with {@link ChannelClosedError} if the channel closes (or refuses data), with the signal's reason if
+ * aborted, or with the read error if the file can't be read.
  */
 export async function streamBlob(o: StreamOptions): Promise<void> {
   const size = o.source.size;
   if (o.offset < 0 || o.offset > size) throw new RangeError(`offset ${o.offset} outside file of ${size} bytes`);
-  if (o.chunkSize <= 0 || o.readSize <= 0) throw new RangeError('chunkSize and readSize must be positive');
+  if (o.offset % o.blockSize !== 0 && o.offset !== size) {
+    throw new RangeError(`offset ${o.offset} is not on a block boundary`);
+  }
+  if (o.chunkSize <= 0 || o.blockSize <= 0) throw new RangeError('chunkSize and blockSize must be positive');
 
-  const read = (start: number): Promise<ArrayBuffer> => {
-    const p = o.source.slice(start, Math.min(start + o.readSize, size)).arrayBuffer();
+  const load = (start: number): Promise<{ bytes: Uint8Array<ArrayBuffer>; sha256: string }> => {
+    const end = Math.min(start + o.blockSize, size);
+    const p = o.source
+      .slice(start, end)
+      .arrayBuffer()
+      .then(async (buf) => {
+        const bytes = new Uint8Array(buf);
+        if (bytes.byteLength !== end - start) throw new Error('file changed size while it was being sent');
+        return { bytes, sha256: await o.digest(bytes) };
+      });
     // Avoid an unhandled rejection if we bail out before awaiting a prefetch.
     p.catch(() => undefined);
     return p;
   };
 
   let position = o.offset;
-  let pending: Promise<ArrayBuffer> | null = position < size ? read(position) : null;
+  let pending = position < size ? load(position) : null;
 
   while (pending) {
-    const block = new Uint8Array(await pending);
-    if (block.byteLength === 0) throw new Error('file became shorter while it was being sent');
-    const nextStart = position + block.byteLength;
-    pending = nextStart < size ? read(nextStart) : null;
+    const { bytes, sha256 } = await pending;
+    const nextStart = position + bytes.byteLength;
+    pending = nextStart < size ? load(nextStart) : null;
 
-    for (let off = 0; off < block.byteLength; off += o.chunkSize) {
-      await waitForCapacity(o, position);
-      const chunk = block.subarray(off, Math.min(off + o.chunkSize, block.byteLength));
-      o.channel.send(chunk);
+    checkAlive(o);
+    o.onBlock({ offset: position, size: bytes.byteLength, sha256 });
+    for (let off = 0; off < bytes.byteLength; off += o.chunkSize) {
+      await waitForCapacity(o);
+      const chunk = bytes.subarray(off, Math.min(off + o.chunkSize, bytes.byteLength));
+      try {
+        o.channel.send(chunk);
+      } catch (err) {
+        // A channel that is being torn down can refuse data before its readyState says so.
+        throw new ChannelClosedError(err);
+      }
+      o.credit.sent += chunk.byteLength;
       position += chunk.byteLength;
       o.onSent?.(position);
     }
   }
 }
 
-async function waitForCapacity(o: StreamOptions, position: number): Promise<void> {
+function checkAlive(o: StreamOptions): void {
+  if (o.signal.aborted) throw o.signal.reason ?? new DOMException('aborted', 'AbortError');
+  if (o.channel.readyState !== 'open') throw new ChannelClosedError();
+}
+
+async function waitForCapacity(o: StreamOptions): Promise<void> {
   for (;;) {
-    if (o.signal.aborted) throw o.signal.reason ?? new DOMException('aborted', 'AbortError');
-    if (o.channel.readyState !== 'open') throw new ChannelClosedError();
-    if (o.channel.bufferedAmount <= o.highWater && position - o.acked() < o.window) return;
+    checkAlive(o);
+    if (o.channel.bufferedAmount <= o.highWater && o.credit.sent - o.credit.acked < o.window) return;
     await o.changed.wait(o.pollMs ?? 250);
   }
 }

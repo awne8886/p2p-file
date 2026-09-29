@@ -46,8 +46,9 @@ export const SECURITY_HEADERS: Record<string, string> = {
 
 /**
  * Serves the built client. Unknown paths that look like app routes (`/`,
- * `/<code>`) get `index.html`; hashed assets are cached forever; everything
- * else (including the service worker) is revalidated on every load.
+ * `/<code>`) get `index.html`; other page loads get it too, with a 404 status,
+ * and the app shows its not-found page. Hashed assets are cached forever;
+ * everything else (including the service worker) is revalidated on every load.
  */
 export function createStaticHandler(root: string) {
   const rootResolved = path.resolve(root);
@@ -87,6 +88,15 @@ export function createStaticHandler(root: string) {
       if (indexStat) return send(req, res, index, indexStat.size, 'no-cache');
     }
 
+    // A browser navigating to some other path: the app's own 404 page. Not for assets, and not for
+    // service-worker download URLs (a hidden iframe loads those), which get a plain 404.
+    const isPageLoad = (req.headers.accept ?? '').includes('text/html');
+    if (isPageLoad && !pathname.startsWith('/assets/') && !pathname.startsWith('/__pizzadrop/')) {
+      const index = path.join(rootResolved, 'index.html');
+      const indexStat = await statFile(index);
+      if (indexStat) return send(req, res, index, indexStat.size, 'no-cache', {}, 404);
+    }
+
     res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8', ...SECURITY_HEADERS }).end('Not found');
   };
 }
@@ -107,8 +117,9 @@ function send(
   size: number,
   cacheControl: string,
   extra: Record<string, string> = {},
+  status = 200,
 ): void {
-  res.writeHead(200, {
+  res.writeHead(status, {
     'Content-Type': MIME[path.extname(filePath).toLowerCase()] ?? 'application/octet-stream',
     'Content-Length': String(size),
     'Cache-Control': cacheControl,

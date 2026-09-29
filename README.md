@@ -2,22 +2,32 @@
 
 Send files of any size straight from your browser to someone else's. Drop a file, get a short link and a QR code, and
 keep the tab open while they download. The file never touches a server: it streams peer-to-peer over an encrypted
-WebRTC data channel, and each file is SHA-256 verified on arrival.
+WebRTC data channel, and every 4 MiB block is SHA-256 verified before it's written to disk.
+
+It runs either as one small Node process (app + signaling), or as a plain static site with no backend at all, e.g.
+**GitHub Pages** or **Cloudflare Pages**: see [Static hosting](#static-hosting-github-pages-cloudflare-pages).
 
 ![PizzaDrop sender view](docs/screenshot-desktop.png)
 
 <p align="center"><img src="docs/screenshot-mobile.png" alt="PizzaDrop on a phone" width="260"></p>
 
-- **No size limit.** Both ends stream: the sender reads the file in 1 MiB slices and the receiver writes straight to
-  disk. Memory stays flat. A 1 GB transfer was measured at a constant ~1.2 GB total across all headless Chrome
-  processes, from start to finish.
+- **No size limit.** Both ends stream: the sender reads the file in 4 MiB blocks and the receiver writes straight to
+  disk. Memory stays flat: during a 1 GB transfer, all headless Chrome processes together peaked at 1.2 GB, up from
+  1.0 GB idle (`npm run bench` reports this).
+- **Nothing unverified reaches the disk.** The sender hashes each 4 MiB block with the browser's native SHA-256 as it
+  reads it; the receiver checks every block before writing it. A damaged block is simply fetched again (and the UI
+  says so), instead of throwing away a whole download.
 - **Short links** like `https://pzza.app/x7k4q`: 5 characters from an alphabet with no `0/O/o`, `1/l/I/i`.
 - **QR code** generated in the browser, standard polarity, error correction level Q. It encodes the plain `https://`
   link.
 - **Many receivers at once**, each with its own connection, progress bar, speed and ETA.
-- **Resumes** mid-file if a receiver's connection drops.
-- **Multiple files** are sent one after another and zipped on the fly on the receiver's side.
-- **Animated colour-ASCII pizza** on a pure black page, with a static version for `prefers-reduced-motion`.
+- **Resumes** from the last verified block if a receiver's connection drops.
+- **Multiple files** stream back to back with no pause between them and are zipped on the fly on the receiver's side.
+- **Add files to a live share.** Drop more files (or use **+ add files**) while sharing: receivers see them straight
+  away, and anyone who already downloaded can fetch just the new ones. Files can be removed too, and a removed file is
+  never sent again.
+- **Animated colour-ASCII pizza** on a pure black page, with a static version for `prefers-reduced-motion`. The 404
+  page gets a whole pizza in the same style, slowly turning clockwise.
 
 ---
 
@@ -35,11 +45,13 @@ WebRTC data channel, and each file is SHA-256 verified on arrival.
   ◀───────────────────────────── relays ◀────────────────────────────────── (both ways)
 
   ══════════════ RTCDataChannel — DTLS-encrypted, browser to browser ══════════════
-  manifest (names, sizes) ──────────────────────────────────────────────▶ shows name, size, [Download]
-  ◀─────────────────────────────────────────────────────────────────────── request(file 0, offset 0)
-  64 KiB binary chunks ─────────────────────────────────────────────────▶ hash + write to disk
-  ◀─────────────────────────────────────────────────────────────────────── ack(bytes written)  ← flow control
-  file-end(sha256) ─────────────────────────────────────────────────────▶ compare → next file … → Done ✓
+  manifest (ids, names, sizes) ─────────────────────────────────────────▶ shows files, [Download]
+  ◀─────────────────────────────────────────────────────────────────────── request(files [0,1,2], offset 0)
+  block(file 0, offset 0, 4 MiB, sha256) ───────────────────────────────▶ assemble the block
+  256 KiB binary chunks ────────────────────────────────────────────────▶ SHA-256 ✓ → write to disk
+  ◀─────────────────────────────────────────────────────────────────────── ack(bytes finished)  ← flow control
+  block … file-end(0) · block … file-end(1) … ──────────────────────────▶ no round trip between files → Done ✓
+  manifest (a file was added) ──────────────────────────────────────────▶ [Download 1 new file]
 ```
 
 - The **signaling server** only issues codes and relays WebRTC session descriptions and ICE candidates. It never
@@ -47,20 +59,25 @@ WebRTC data channel, and each file is SHA-256 verified on arrival.
 - A **code** lives until the sender stops sharing or closes the tab (released immediately on `pagehide`, or after a
   20 s grace period if the socket just drops). It also expires after 24 h without signaling activity. Codes are
   case-insensitive, and joins are rate-limited per IP so codes can't be enumerated.
-- **Multiple files** are sent one after another, and the receiver zips them on the fly (STORE, zip64-capable) into a
-  single `pizzadrop-<code>.zip`. Zipping happens on the receiver's side so every file can still be hashed and resumed
-  individually, and so the zip's exact size is known up front.
+- **Multiple files** are sent back to back, and the receiver zips them on the fly (STORE, zip64-capable) into a
+  single `pizzadrop-<code>.zip`. Zipping happens on the receiver's side so every block can still be verified and
+  resumed individually, and so the zip's exact size is known up front. Files added later arrive as a second download
+  (`pizzadrop-<code>-2.zip`, or the file itself if it's just one).
 
 ## Tech choices
 
 - **Vite + React + TypeScript** for the client. It's a single-page app with two routes (`/` and `/<code>`), so a
   static SPA fits better than an SSR framework like Next.js. Vite also handles the Web Workers and the fixed-name
   service worker build with no extra tooling. Runtime dependencies are `react`, `react-dom`, `@noble/hashes`
-  (incremental SHA-256), `client-zip` (streaming zip) and `qrcode-generator`.
+  (SHA-256 fallback for plain-`http://` LAN testing, where WebCrypto isn't available), `client-zip` (streaming zip) and `qrcode-generator`.
 - **Node.js + `ws`** for the signaling server rather than a Cloudflare Worker + Durable Object. One small process
   serves the built client and the WebSocket on the same origin, with no vendor lock-in. It deploys as a single Docker
   image anywhere, and in-memory rooms are the simplest correct state for short-lived codes. The trade-off is that you
   run one instance: see [Known limits](#known-limits).
+- **PeerJS as a backend-free alternative.** The static build (`npm run build:static`) signals through a PeerJS server
+  instead, by default the free public one, so the whole app can live on GitHub Pages or Cloudflare Pages.
+  `client/src/lib/peerjs.ts` plays the part of the signaling server on top of PeerJS's message relay, so the rest of
+  the app doesn't know the difference. No PeerJS library is shipped: it speaks the relay's small JSON protocol directly.
 
 ## Repository layout
 
@@ -69,11 +86,13 @@ shared/   wire protocol types + validators, short-code generator, formatting hel
 server/   signaling server: rooms & codes, rate limiting, ICE/TURN config, static hosting
 client/   web app
   src/ascii/      ASCII pizza: illustration, renderer
-  src/lib/        transfer engine: sender, receiver, back-pressure, hashing, save sinks, signaling
+  src/lib/        transfer engine: sender, receiver, back-pressure, block hashing, save sinks, signaling
+                  (own server or PeerJS)
   src/sw/         service worker for streaming downloads
-  src/workers/    SHA-256 worker, OPFS writer worker
+  src/workers/    OPFS writer worker
   src/pages/      send + receive screens
-e2e/      Playwright end-to-end tests (real browsers, real WebRTC)
+e2e/      Playwright end-to-end tests (real browsers, real WebRTC) and a throughput benchmark
+.github/  GitHub Pages deployment workflow
 scripts/  dev runner
 ```
 
@@ -95,10 +114,12 @@ test those.
 | -------------------------- | ------------------------------------------------------------------------------ |
 | `npm run dev`              | shared (watch) + signaling server (tsx watch) + Vite dev server                |
 | `npm run build`            | compile `shared` and `server`, bundle `client` into `client/dist`              |
+| `npm run build:static`     | bundle `client` for a static host (PeerJS signaling); see Static hosting      |
 | `npm start`                | production server on `$PORT` (default 8080), serving `client/dist` + `/ws`     |
 | `npm run check`            | ESLint + Prettier check + typecheck (all packages, e2e, scripts) + unit tests  |
 | `npm test`                 | Vitest unit tests (short codes, protocol validation, rooms, back-pressure…)    |
 | `npm run test:e2e`         | build first; drives headless Chromium through every save path (see below)      |
+| `npm run bench`            | build first; one big transfer, reports MB/s and browser CPU-seconds per GB     |
 
 The e2e suite starts the production server on a free port and runs real WebRTC transfers between browser contexts:
 - QR decoding back to the link, and ≤ 15 stars
@@ -106,11 +127,18 @@ The e2e suite starts the production server on a free port and runs real WebRTC t
   picker)
 - multi-file zip, including duplicate names and an empty file
 - two simultaneous receivers
-- a 256 MB transfer whose data channel is killed at 20% and resumes to a byte-identical file
+- a byte flipped in flight: the block fails its check, is fetched again, and the file is byte-identical; a block that
+  keeps failing stops the download instead of saving it
+- files added to a live share, downloaded as a second batch; a removed file isn't offered, and removing one stops a
+  download that still needs it
+- a 256 MB transfer whose data channel is killed at 20% and resumes to a byte-identical file; a channel that silently
+  stops delivering is noticed, and the download resumes on a fresh connection
 - expired links
 - the `beforeunload` prompt, and code release when the sender's tab closes
-- static rendering under reduced motion
+- static rendering under reduced motion; the 404 page's spinning whole pizza (and its 404 status)
 - mobile layout with no horizontal overflow
+- the static build, served like GitHub Pages under `/p2p-file/` with the 404.html fallback, with a local PeerJS
+  server: a service-worker download, a resume after a dropped connection, and an expired link
 
 Set `CHROMIUM_PATH` to point at a Chromium binary and `E2E_BIG_MB` to change the large-file size.
 
@@ -156,7 +184,71 @@ Any Docker host with WebSocket support works. Keep it to **one instance** (rooms
 
 Health check: `GET /healthz` → `{"ok":true,"rooms":…,"receivers":…}`.
 
+### Static hosting (GitHub Pages, Cloudflare Pages)
+
+A static host can't run the WebSocket signaling server, so `npm run build:static` makes a build that signals through a
+[PeerJS](https://peerjs.com) server instead: by default the free public one at `0.peerjs.com`. Everything else is
+identical: the files still go directly between browsers, block-verified, and the PeerJS server only relays the
+connection setup (it never sees file names or contents).
+
+**GitHub Pages** (`https://<user>.github.io/<repo>/`):
+
+1. In the repository, open **Settings → Pages → Build and deployment** and set **Source** to **GitHub Actions**.
+   (With "Deploy from a branch", GitHub renders the README instead of the app.)
+2. Push to `main`, or run the **Deploy to GitHub Pages** workflow by hand (**Actions** tab). The workflow
+   ([`.github/workflows/pages.yml`](.github/workflows/pages.yml)) runs the checks, builds with the right base path
+   (`/<repo>/`), copies `index.html` to `404.html` so share links like `/<repo>/x7k4q` open the app, and deploys.
+
+Share links then look like `https://<user>.github.io/<repo>/x7k4qm` (6 characters, see below). To try a static build
+locally first: `npm run build:static && npm run preview -w client`. GitHub serves those deep
+links from `404.html`, so they arrive with an HTTP 404 status; browsers don't care, but some link-preview bots do.
+
+**Cloudflare Pages** (with your own subdomain):
+
+1. **Workers & Pages → Create → Pages → Connect to Git**, pick this repository.
+2. Build command `npm run build:static`, build output directory `client/dist`. Node comes from `.nvmrc`.
+   Leave `BASE_PATH` unset: the site is served from `/`.
+3. **Custom domains → Set up a custom domain**, e.g. `drop.example.com`. If the domain's DNS is on Cloudflare, the
+   record is created for you.
+4. Optionally set the build variable `VITE_PUBLIC_URL=https://drop.example.com`, so links always use your domain even
+   when someone opens the `*.pages.dev` address.
+
+Cloudflare Pages treats a site without a `404.html` as a single-page app and serves `index.html` for every path, so
+links are plain `https://drop.example.com/x7k4q` with a 200 status. Don't add the 404.html copy there.
+
+**Trade-offs of the public PeerJS server**, compared with running `server/`:
+- It's a free community service with no uptime guarantee. If it's down, nobody can start a transfer (running
+  transfers aren't affected). `VITE_PEERJS_URL` points the build at another PeerJS server, e.g. your own
+  (`npx peer --port 9000`), and `VITE_SIGNAL_URL` at a PizzaDrop server (`server/`) running somewhere else.
+- It can't rate-limit joins the way `server/` does, so codes are 6 characters (≈ 887 M combinations) instead of 5.
+- As with any signaling server, you trust its operator not to tamper with the connection setup (see
+  [Known limits](#known-limits)).
+- There's no TURN relay unless you add one with `VITE_ICE_SERVERS`, so two peers that are both behind strict NATs
+  can't connect. In a public static site, TURN credentials are visible to anyone, so use a TURN service meant for
+  that, or one with short-lived credentials.
+
+The workflow reads these as repository **variables** (Settings → Secrets and variables → Actions → Variables):
+`SIGNAL_URL`, `PEERJS_URL`, `PEERJS_KEY`, `ICE_SERVERS`, `PUBLIC_URL`.
+
 ## Environment variables
+
+### Build time (static builds)
+
+Read by Vite when bundling the client; `client/.env.static` holds the defaults for `npm run build:static`.
+
+| Variable            | Default                          | Meaning                                                                        |
+| ------------------- | -------------------------------- | ------------------------------------------------------------------------------ |
+| `BASE_PATH`         | `/`                              | Path the site is served under, e.g. `/p2p-file/` for a GitHub Pages project    |
+| `OUT_DIR`           | `client/dist`                    | Where the build goes                                                           |
+| `VITE_SIGNALING`    | `server` (`peerjs` when static)  | `server`: PizzaDrop's own signaling server. `peerjs`: a PeerJS server          |
+| `VITE_SIGNAL_URL`   | `/ws` on the page's origin       | WebSocket URL of a PizzaDrop signaling server hosted elsewhere                 |
+| `VITE_PEERJS_URL`   | `wss://0.peerjs.com/peerjs`      | PeerJS server WebSocket endpoint                                               |
+| `VITE_PEERJS_KEY`   | `peerjs`                         | PeerJS server key                                                              |
+| `VITE_ICE_SERVERS`  | Google + Cloudflare STUN         | JSON array of `RTCIceServer` objects (PeerJS mode; `server/` sends its own)    |
+| `VITE_PUBLIC_URL`   | _(page origin)_                  | Origin for share links, e.g. `https://drop.example.com`                        |
+| `VITE_CODE_LENGTH`  | `6`                              | Share-code length in PeerJS mode (5 or 6)                                      |
+
+### Server (`server/`)
 
 All optional. See [`.env.example`](.env.example).
 
@@ -218,11 +310,15 @@ Firefox private windows disable service workers and OPFS, so they fall back to i
   sending, except on iOS.
 - **Resuming** works within a page session (network blips, ICE failures, a dropped data channel). A receiver that
   reloads the page starts over, because the partially written file belongs to the old page.
-- **Throughput** is bounded by CPU (SCTP + DTLS + SHA-256) and the network. In the CPU-starved, GPU-less CI
-  container, both browsers on one 4-vCPU box ran at about 13–22 MB/s. Real machines go faster, and LAN transfers are
-  usually disk- or Wi-Fi-bound. Through a TURN relay you get the relay's bandwidth.
+- **Throughput** is bounded by the network and by the browser's own WebRTC stack (SCTP + DTLS), which runs on the
+  CPU. In the CPU-starved, GPU-less CI container (both browsers on one 4-vCPU box), raw WebRTC with no app code tops
+  out around 30–35 MB/s and PizzaDrop reaches 23–24 MB/s; see [Speed](#speed) for what changed and why. Real
+  machines go faster, and LAN transfers are usually disk- or Wi-Fi-bound. Through a TURN relay you get the relay's
+  bandwidth.
 - **OPFS staging (Safari/iOS)** needs free disk space for the file and then briefly a second copy while the browser
   moves it to Downloads.
+- **Files added to a share** reach receivers that already downloaded as a separate download; a zip that's already
+  being written can't grow.
 - **One server instance.** Rooms live in memory. Scaling out would need routing by code (sticky sessions) or a shared
   store such as Redis pub/sub.
 - **Folders** can't be dropped directly. Zip them first, or select the files inside.
@@ -237,38 +333,74 @@ Firefox private windows disable service workers and OPFS, so they fall back to i
 
 ## How it was built
 
-### Streaming and back-pressure
+### Streaming, integrity and back-pressure
 
 **Sender.** Each receiver gets its own `RTCPeerConnection` and one ordered, reliable `RTCDataChannel`, so a slow or
-dropped receiver can't affect the others. For each requested file, `streamBlob()` (`client/src/lib/flow.ts`) reads
-the `File` in 1 MiB `slice().arrayBuffer()` blocks, prefetching exactly one block ahead. It sends each block as
-64 KiB messages. Before every `send()` it checks two conditions:
+dropped receiver can't affect the others. A receiver asks for a list of files (`request`), and the sender streams them
+back to back. For each file, `streamBlob()` (`client/src/lib/flow.ts`) reads the `File` one 4 MiB block at a time and
+hashes each block with WebCrypto's native SHA-256, reading and hashing the next block while the current one is on the
+wire. Before a block's bytes it sends a small `block` header (file id, offset, size, SHA-256); the bytes follow as
+messages of up to 256 KiB, capped at the connection's negotiated `sctp.maxMessageSize`. Before every `send()` it checks
+two conditions:
 
-1. **Local back-pressure:** `bufferedAmount ≤ 4 MiB`. Otherwise it waits for `bufferedamountlow`, which fires at
-   1 MiB, with a 250 ms poll as a safety net. Chrome closes channels whose buffer passes 16 MiB, so this keeps a wide
-   margin.
-2. **End-to-end flow control:** no more than 16 MiB sent but not yet acknowledged by the receiver. WebRTC has no
-   receive-side back-pressure, so without this a receiver with a slow disk would silently buffer the whole file in
-   RAM. The receiver sends `ack(bytes written)` every 1 MiB as its sink *consumes* data, not as it arrives.
+1. **Local back-pressure:** `bufferedAmount ≤ 8 MiB`. Otherwise it waits for `bufferedamountlow`, which fires at
+   4 MiB, with a 250 ms poll as a safety net. Chrome closes channels whose buffer passes 16 MiB, so this keeps a wide
+   margin, while the low mark keeps several megabytes queued for the network while JavaScript refills the buffer.
+2. **End-to-end flow control:** no more than 48 MiB sent on the channel but not yet finished with by the receiver.
+   WebRTC has no receive-side back-pressure, so without this a receiver with a slow disk would silently buffer the
+   whole file in RAM. The receiver acknowledges bytes as its sink *consumes* them (or as it throws them away), not as
+   they arrive. The count spans files, so the next file starts streaming immediately instead of after a round trip.
 
 Unit tests pin all of these properties down with a fake channel and fake slow disks:
 - `bufferedAmount` never exceeds high-water plus one chunk
-- in-flight bytes never exceed the window plus one chunk
-- at most one outstanding read
-- byte-exact output, resume from an offset, prompt abort, and close handling
+- in-flight bytes never exceed the window plus one chunk, across files
+- at most one outstanding read, and every block's announced hash matches its bytes
+- byte-exact output, resume from a block boundary, prompt abort, and close handling
 
-**Receiver.** Each file is a pull-based `ReadableStream` (`highWaterMark: 0`) fed from the data channel. Bytes are
-handed over only when the sink asks for more, which is what drives the acks. A single file is piped straight into the
-sink. Multiple files go through `client-zip`'s `makeZip` first, and the next file is only requested once the backlog
-drops below half the window. Every chunk is also posted to a Web Worker running an incremental SHA-256
-(`@noble/hashes`; WebCrypto can't hash incrementally). At each `file-end` the receiver compares that digest with the
-one the sender announced. The sender fingerprints each file once, in its own worker, as soon as it's dropped. On a
-mismatch the sink is aborted, so the File System Access swap file is discarded and the service-worker download fails,
-and the UI says so.
+**Receiver.** Chunks are copied into the block they belong to. When a block is complete, its SHA-256 is computed
+(natively, off the main thread) and compared with the header's; blocks are checked in parallel but released in order.
+Only a verified block goes on to the file's pull-based `ReadableStream` (`highWaterMark: 0`), which hands it over
+when the sink asks for more, and that is what drives the acks. A single file is piped straight into the sink. Several
+go through `client-zip`'s `makeZip`. So a verified block is also one 4 MiB disk write, much cheaper than many small
+ones.
+
+A block that fails its check is released, not written, and the receiver re-requests from that block (`seq` numbers
+tell the sender's leftover bytes from the old request apart from the new ones). The UI reports how many blocks were
+repaired. A block that fails three times stops the download and discards what the sink allows (the File System Access
+swap file, the service-worker download).
 
 **Resume.** Receivers keep a per-tab client id. If the channel drops, the receiver rejoins through signaling, the
-sender recognises the id and replaces that receiver's connection, and the receiver re-requests the current file from
-the exact byte offset it had received. The hash state and the sink simply continue.
+sender recognises the id and replaces that receiver's connection, and the receiver re-requests the rest of its files
+starting at the first unverified block. The sink simply continues. A connection can also stall without closing (a
+network path that dies quietly), so a download that makes no progress at all for 20 s is treated the same way:
+reconnect, resume. Three stalls in a row with nothing written in between end the download with an error instead of
+retrying forever.
+
+**Adding files.** Every file has a stable id. The sender re-sends the manifest whenever files are added or removed,
+and a receiver keeps track of which ids it has saved, so the next download is just the new ones. Removing a file hides
+it from receivers that haven't asked for it and stops any download that still needs it.
+
+### Speed
+
+Measured with `npm run bench` (400 MB, service-worker sink) in the 4-vCPU CI container, against the previous version
+of the engine built from the same tree:
+
+| | throughput | browser CPU per GB |
+| --- | --- | --- |
+| before (JS SHA-256 of every byte, 64 KiB messages) | 17.6–18.5 MB/s | 191–199 CPU-s |
+| after | 22.9–24.4 MB/s | 125–133 CPU-s |
+
+500 files of 64 KB went from 4.4–6.0 s to 1.9 s, with no network latency at all; over a real link the old per-file
+round trip also cost one RTT per file. Where the time went:
+
+- **Hashing.** The receiver used to run a pure-JavaScript SHA-256 over every byte (≈ 140 MB/s on this box, less on
+  phones), a hard ceiling on fast LANs. WebCrypto's native SHA-256 runs at ≈ 1 GB/s here. The sender also no longer
+  reads every file twice (once to fingerprint it, once to send it).
+- **Message size.** 256 KiB messages instead of 64 KiB: 4× fewer `send()` calls and `message` events. Raw WebRTC alone
+  goes 11% faster with them in this container.
+- **The animated background.** Drawing the ASCII pizza is a few thousand canvas blits a frame on the main thread,
+  where WebRTC's messages are handled too. It now animates at 30 fps while a transfer runs.
+- **Round trips between files**, gone as described above.
 
 ### The receiver's fallback ladder (`client/src/lib/sinks.ts`)
 
@@ -318,4 +450,9 @@ The difference is that here the colours come from a pizza.
    - The animation pauses when the tab is hidden.
    - With `prefers-reduced-motion` it renders one static frame.
    - Dragging a file over the page makes the waves speed up and brighten a little. An active transfer does the same,
-     more gently.
+     more gently, and drops the frame rate to 30 fps to leave the CPU to the transfer.
+6. **The 404 page** draws a whole pizza (`drawWholePizza`) in the same style, turning clockwise once every 90 s. The
+   glyph grid can't rotate (the glyphs have to stay upright), so the illustration is rasterised once into a 320×320
+   map of materials, and every frame each cell looks up which part of the turning pizza is under it. A circle's
+   outline doesn't change as it turns, so layout and star placement still happen once per resize. The Node server
+   answers any unknown page with this page and a 404 status; GitHub Pages does the same through `404.html`.

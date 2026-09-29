@@ -1,5 +1,5 @@
 import { dist2, hash2, hexToRgb, mix, mulberry32, rgbCss, type RGB } from './color';
-import { drawPizzaSlice, MATERIALS, outlinePoints } from './pizzaArt';
+import { drawPizzaSlice, drawWholePizza, MATERIALS, outlinePoints, WHOLE_RADIUS } from './pizzaArt';
 
 /**
  * Animated colour-ASCII pizza.
@@ -20,7 +20,15 @@ import { drawPizzaSlice, MATERIALS, outlinePoints } from './pizzaArt';
  *    random flicker adds shimmer.
  *
  * Outside the slice the canvas is pure black apart from ≤ 15 dim "stars".
+ *
+ * The `whole` scene (the 404 page) draws an entire pizza instead, turning
+ * slowly clockwise. The glyph grid itself never rotates, so glyphs stay
+ * upright: the illustration is rasterised once into a material map, and each
+ * frame every cell looks up which part of the turning pizza is under it.
  */
+
+/** `slice`: the tilted slice (every normal page). `whole`: a whole pizza that slowly spins (the 404 page). */
+export type PizzaScene = 'slice' | 'whole';
 
 const RAMP = ['.', ':', '+', '*', '=', '#', '%', '@'] as const;
 const LEVELS = 12;
@@ -35,6 +43,13 @@ const FONT_STACK =
 const SUB_X = 4;
 const SUB_Y = 6;
 const TAU = Math.PI * 2;
+/** The whole pizza turns clockwise once every this many seconds. */
+const SPIN_PERIOD_S = 90;
+/** Texels across the whole pizza's material map. */
+const MAP_SIZE = 320;
+/** Material-map texel outside the pizza. */
+const EMPTY = 255;
+const CRUST_DARK = MATERIALS.findIndex((m) => m.name === 'crust-dark');
 
 /**
  * Side length (CSS px) of the square the tilted slice is fitted into: 52% of
@@ -67,6 +82,7 @@ interface Star {
 
 export interface RendererOptions {
   reducedMotion?: boolean;
+  scene?: PizzaScene;
   /** Seed for star placement; defaults to a fresh random seed per page load. */
   seed?: number;
 }
@@ -74,6 +90,7 @@ export interface RendererOptions {
 export class AsciiPizzaRenderer {
   private readonly ctx: CanvasRenderingContext2D;
   private readonly seed: number;
+  private readonly scene: PizzaScene;
   private reducedMotion: boolean;
 
   private width = 0;
@@ -98,6 +115,14 @@ export class AsciiPizzaRenderer {
   private cellFloor = new Float32Array(0);
   private cellRand = new Float32Array(0);
 
+  // Whole pizza: each cell's position in the pizza's own (unturned) units, the
+  // illustration's material per texel, and how far it has turned (radians).
+  private cellLX = new Float32Array(0);
+  private cellLY = new Float32Array(0);
+  private matMap = new Uint8Array(0);
+  private spin = 0;
+  private appliedSpin = NaN;
+
   /** Glyph sprites: tight cells for ordinary levels, padded cells (room for the glow) for bright ones. */
   private atlases: [Atlas, Atlas] | null = null;
 
@@ -109,6 +134,7 @@ export class AsciiPizzaRenderer {
   private animTime = 0;
   private energy = 0;
   private targetEnergy = 0;
+  private minFrameMs = 0;
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -118,6 +144,7 @@ export class AsciiPizzaRenderer {
     if (!ctx) throw new Error('2D canvas not supported');
     this.ctx = ctx;
     this.reducedMotion = opts.reducedMotion ?? false;
+    this.scene = opts.scene ?? 'slice';
     this.seed = opts.seed ?? Math.floor(Math.random() * 2 ** 31);
   }
 
@@ -163,6 +190,15 @@ export class AsciiPizzaRenderer {
     if (this.reducedMotion) this.renderOnce();
   }
 
+  /**
+   * Cap the frame rate (0 = the display's own). While a transfer runs, every
+   * millisecond of main thread spent drawing is one WebRTC can't use, and the
+   * slow shimmer looks the same at 30 fps.
+   */
+  setMaxFps(fps: number): void {
+    this.minFrameMs = fps > 0 ? 1000 / fps : 0;
+  }
+
   dispose(): void {
     this.stop();
     this.atlases = null;
@@ -171,6 +207,7 @@ export class AsciiPizzaRenderer {
   // ─── Layout & sampling ───────────────────────────────────────────────────
 
   private layoutAndSample(): void {
+    if (this.scene === 'whole') return this.layoutWhole();
     const { width: w, height: h } = this;
     const extent = sliceExtent(w, h);
 
@@ -279,6 +316,115 @@ export class AsciiPizzaRenderer {
     this.cellRand = Float32Array.from(xs, () => rand());
   }
 
+  /** The whole pizza: same size and glyph grid as the slice, but a circle, and sampled through a material map. */
+  private layoutWhole(): void {
+    const { width: w, height: h } = this;
+    const extent = sliceExtent(w, h);
+    this.cellH = Math.max(8.5, Math.min(15, extent / 42));
+    this.fontPx = this.cellH / 1.2;
+    this.cellW = this.fontPx * 0.72;
+
+    const scale = extent / (2 * WHOLE_RADIUS);
+    const margin = 2;
+    this.cols = Math.ceil(extent / this.cellW) + margin * 2;
+    this.rows = Math.ceil(extent / this.cellH) + margin * 2;
+    this.gridX = w / 2 - (this.cols * this.cellW) / 2;
+    this.gridY = h / 2 - (this.rows * this.cellH) / 2;
+
+    // Rasterise the illustration once and store each texel's nearest material.
+    const off = document.createElement('canvas');
+    off.width = MAP_SIZE;
+    off.height = MAP_SIZE;
+    const octx = off.getContext('2d', { willReadFrequently: true });
+    if (!octx) return;
+    const k = MAP_SIZE / (2 * WHOLE_RADIUS);
+    octx.setTransform(k, 0, 0, k, MAP_SIZE / 2, MAP_SIZE / 2);
+    drawWholePizza(octx);
+    const px = octx.getImageData(0, 0, MAP_SIZE, MAP_SIZE).data;
+    const bases: RGB[] = MATERIALS.map((m) => hexToRgb(m.base));
+    const map = new Uint8Array(MAP_SIZE * MAP_SIZE);
+    for (let i = 0; i < map.length; i++) {
+      if (px[i * 4 + 3]! < 128) {
+        map[i] = EMPTY;
+        continue;
+      }
+      const rgb: RGB = [px[i * 4]!, px[i * 4 + 1]!, px[i * 4 + 2]!];
+      let best = 0;
+      let bestD = Infinity;
+      bases.forEach((base, m) => {
+        const d = dist2(rgb, base);
+        if (d < bestD) {
+          bestD = d;
+          best = m;
+        }
+      });
+      map[i] = best;
+    }
+    this.matMap = map;
+
+    // Cells: everything inside the circle, with coverage fading over the last cell at the rim.
+    const cellLocal = this.cellH / scale;
+    this.coverageGrid = new Float32Array(this.cols * this.rows);
+    const xs: number[] = [];
+    const ys: number[] = [];
+    const lxs: number[] = [];
+    const lys: number[] = [];
+    const covs: number[] = [];
+    for (let row = 0; row < this.rows; row++) {
+      for (let col = 0; col < this.cols; col++) {
+        const x = this.gridX + (col + 0.5) * this.cellW;
+        const y = this.gridY + (row + 0.5) * this.cellH;
+        const lx = (x - w / 2) / scale;
+        const ly = (y - h / 2) / scale;
+        const coverage = Math.max(0, Math.min(1, (WHOLE_RADIUS - Math.hypot(lx, ly)) / cellLocal + 0.5));
+        this.coverageGrid[row * this.cols + col] = coverage;
+        if (coverage < 0.12) continue;
+        xs.push(x);
+        ys.push(y);
+        lxs.push(lx);
+        lys.push(ly);
+        covs.push(coverage);
+      }
+    }
+
+    const rand = mulberry32(this.seed ^ 0x5eed);
+    this.count = xs.length;
+    this.cellX = Float32Array.from(xs);
+    this.cellY = Float32Array.from(ys);
+    this.cellLX = Float32Array.from(lxs);
+    this.cellLY = Float32Array.from(lys);
+    this.cellCov = Float32Array.from(covs);
+    this.cellMat = new Uint8Array(this.count);
+    this.cellDensity = new Int8Array(this.count);
+    this.cellFloor = new Float32Array(this.count);
+    this.cellRand = Float32Array.from(xs, () => rand());
+    this.appliedSpin = NaN;
+  }
+
+  /** Whole pizza: find the material under every cell once the pizza has turned `angle` radians clockwise. */
+  private applySpin(angle: number): void {
+    if (angle === this.appliedSpin) return;
+    this.appliedSpin = angle;
+    // A point p of the pizza shows at R(angle)·p (canvas y points down, so +angle is clockwise);
+    // the cell at q therefore shows p = R(−angle)·q.
+    const c = Math.cos(angle);
+    const s = Math.sin(angle);
+    const k = MAP_SIZE / (2 * WHOLE_RADIUS);
+    const half = MAP_SIZE / 2;
+    for (let i = 0; i < this.count; i++) {
+      const lx = this.cellLX[i]!;
+      const ly = this.cellLY[i]!;
+      const col = Math.floor((lx * c + ly * s) * k + half);
+      const row = Math.floor((-lx * s + ly * c) * k + half);
+      let m = col >= 0 && col < MAP_SIZE && row >= 0 && row < MAP_SIZE ? this.matMap[row * MAP_SIZE + col]! : EMPTY;
+      if (m === EMPTY) m = CRUST_DARK; // anti-aliased rim
+      const mat = MATERIALS[m]!;
+      this.cellMat[i] = m;
+      this.cellDensity[i] = mat.density;
+      this.cellFloor[i] = mat.floor;
+    }
+  }
+
   // ─── Glyph atlas ─────────────────────────────────────────────────────────
 
   private buildAtlas(): void {
@@ -380,12 +526,15 @@ export class AsciiPizzaRenderer {
 
   private readonly frame = (now: number): void => {
     if (!this.running) return;
+    this.rafId = requestAnimationFrame(this.frame);
+    // Skip this display frame if a frame-rate cap is on and the last draw was too recent (1 ms of vsync jitter).
+    if (this.lastFrame && now - this.lastFrame < this.minFrameMs - 1) return;
     const dt = this.lastFrame ? Math.min(0.1, (now - this.lastFrame) / 1000) : 0;
     this.lastFrame = now;
     this.energy += (this.targetEnergy - this.energy) * Math.min(1, dt * 3);
     this.animTime += dt * (1 + this.energy * 1.4);
+    if (this.scene === 'whole') this.spin = (this.spin + (dt * TAU) / SPIN_PERIOD_S) % TAU;
     this.draw(this.animTime, now / 1000, true);
-    this.rafId = requestAnimationFrame(this.frame);
   };
 
   private renderOnce(): void {
@@ -412,6 +561,7 @@ export class AsciiPizzaRenderer {
 
     if (!atlases) return;
     ctx.imageSmoothingEnabled = false;
+    if (this.scene === 'whole') this.applySpin(this.spin);
 
     const { cellW, cellH, energy } = this;
     const lambdaX = cellW * 34;

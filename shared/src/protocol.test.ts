@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { parseClientMessage, parseReceiverMessage, parseSenderMessage, parseServerMessage } from './protocol.js';
+import {
+  MAX_BLOCK_SIZE,
+  parseClientMessage,
+  parseReceiverMessage,
+  parseSenderMessage,
+  parseServerMessage,
+  PROTOCOL_VERSION,
+} from './protocol.js';
 
 const j = (v: unknown) => JSON.stringify(v);
 
@@ -49,30 +56,50 @@ describe('parseServerMessage', () => {
 });
 
 describe('peer messages', () => {
-  it('parses sender messages', () => {
-    const manifest = { type: 'manifest', version: 1, files: [{ name: 'a.txt', size: 3, type: '', lastModified: 0 }] };
+  const file = { id: 0, name: 'a.txt', size: 3, type: '', lastModified: 0 };
+  const hash = 'a'.repeat(64);
+
+  it('parses manifests', () => {
+    const manifest = { type: 'manifest', version: PROTOCOL_VERSION, files: [file, { ...file, id: 3, name: 'b' }] };
     expect(parseSenderMessage(j(manifest))).toEqual(manifest);
-    expect(parseSenderMessage(j({ type: 'manifest', version: 1, files: [] }))).toBeNull();
-    expect(
-      parseSenderMessage(j({ ...manifest, files: [{ name: '', size: 3, type: '', lastModified: 0 }] })),
-    ).toBeNull();
-    expect(
-      parseSenderMessage(j({ ...manifest, files: [{ name: 'a', size: -1, type: '', lastModified: 0 }] })),
-    ).toBeNull();
-    expect(parseSenderMessage(j({ type: 'file-end', index: 0, sha256: 'a'.repeat(64) }))).not.toBeNull();
-    expect(parseSenderMessage(j({ type: 'file-end', index: 0, sha256: 'A'.repeat(64) }))).toBeNull();
-    expect(parseSenderMessage(j({ type: 'file-end', index: 0, sha256: 'abc' }))).toBeNull();
+    // An empty share is representable (the UI says so); malformed entries are not.
+    expect(parseSenderMessage(j({ ...manifest, files: [] }))).toEqual({ ...manifest, files: [] });
+    expect(parseSenderMessage(j({ ...manifest, files: [{ ...file, name: '' }] }))).toBeNull();
+    expect(parseSenderMessage(j({ ...manifest, files: [{ ...file, size: -1 }] }))).toBeNull();
+    expect(parseSenderMessage(j({ ...manifest, files: [{ ...file, id: undefined }] }))).toBeNull();
+    // Ids must be unique.
+    expect(parseSenderMessage(j({ ...manifest, files: [file, { ...file, name: 'b' }] }))).toBeNull();
+  });
+
+  it('passes another protocol version through, so the receiver can say what went wrong', () => {
+    const old = { type: 'manifest', version: 1, files: [{ name: 'a.txt', size: 3, type: '', lastModified: 0 }] };
+    expect(parseSenderMessage(j(old))).toEqual({ type: 'manifest', version: 1, files: [] });
+  });
+
+  it('parses blocks and file ends', () => {
+    const block = { type: 'block', seq: 1, id: 2, offset: 4194304, size: 4194304, sha256: hash };
+    expect(parseSenderMessage(j(block))).toEqual(block);
+    expect(parseSenderMessage(j({ ...block, sha256: 'A'.repeat(64) }))).toBeNull();
+    expect(parseSenderMessage(j({ ...block, sha256: 'abc' }))).toBeNull();
+    expect(parseSenderMessage(j({ ...block, size: 0 }))).toBeNull();
+    // The receiver allocates `size` bytes, so it's capped.
+    expect(parseSenderMessage(j({ ...block, size: MAX_BLOCK_SIZE }))).not.toBeNull();
+    expect(parseSenderMessage(j({ ...block, size: MAX_BLOCK_SIZE + 1 }))).toBeNull();
+    expect(parseSenderMessage(j({ type: 'file-end', seq: 1, id: 0 }))).toEqual({ type: 'file-end', seq: 1, id: 0 });
+    expect(parseSenderMessage(j({ type: 'file-end', seq: 1 }))).toBeNull();
   });
 
   it('parses receiver messages', () => {
-    expect(parseReceiverMessage(j({ type: 'request', index: 0, offset: 10 }))).toEqual({
-      type: 'request',
-      index: 0,
-      offset: 10,
-    });
-    expect(parseReceiverMessage(j({ type: 'request', index: -1, offset: 0 }))).toBeNull();
-    expect(parseReceiverMessage(j({ type: 'request', index: 0, offset: 1.5 }))).toBeNull();
-    expect(parseReceiverMessage(j({ type: 'ack', index: 0, bytes: 5 }))).toEqual({ type: 'ack', index: 0, bytes: 5 });
+    const request = { type: 'request', seq: 3, files: [0, 2], offset: 4194304, written: 10, total: 99 };
+    expect(parseReceiverMessage(j(request))).toEqual(request);
+    expect(parseReceiverMessage(j({ ...request, files: [] }))).toBeNull();
+    expect(parseReceiverMessage(j({ ...request, files: [-1] }))).toBeNull();
+    expect(parseReceiverMessage(j({ ...request, offset: 1.5 }))).toBeNull();
+    expect(parseReceiverMessage(j({ ...request, total: undefined }))).toBeNull();
+    const ack = { type: 'ack', bytes: 5, written: 4, total: 9 };
+    expect(parseReceiverMessage(j(ack))).toEqual(ack);
+    expect(parseReceiverMessage(j({ ...ack, bytes: -1 }))).toBeNull();
     expect(parseReceiverMessage(j({ type: 'done' }))).toEqual({ type: 'done' });
+    expect(parseReceiverMessage(j({ type: 'cancel' }))).toEqual({ type: 'cancel' });
   });
 });

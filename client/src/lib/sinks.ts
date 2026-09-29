@@ -11,11 +11,12 @@
  *     written to OPFS from a worker, then handed to the download manager.
  *  4. In-memory Blob — last resort; the UI warns above {@link BLOB_WARN_BYTES}.
  */
+import { appPath, BASE_PATH } from './config';
 import { BLOB_WARN_BYTES } from './constants';
 import { Notifier } from './flow';
 import { randomId } from './ids';
 import { OPFS_DIR, type OpfsCommand, type OpfsRequest, type OpfsResponse } from './opfsProtocol';
-import { SW_DOWNLOAD_PREFIX, type SwPortMessage, type SwRegisterMessage } from './swProtocol';
+import { SW_DOWNLOAD_PATH, type SwPortMessage, type SwRegisterMessage } from './swProtocol';
 
 export type SinkKind = 'file-system-access' | 'service-worker' | 'opfs' | 'memory';
 
@@ -159,9 +160,11 @@ async function openFileSystemAccessSink(name: string): Promise<Sink> {
 
 // ─── 2. Service worker stream ──────────────────────────────────────────────
 
-const SW_URL = import.meta.env.DEV ? '/src/sw/sw.ts' : '/sw.js';
-/** Bytes the page may post ahead of what the browser's download has consumed. */
-const SW_WINDOW = 4 * 1024 * 1024;
+const SW_URL = import.meta.env.DEV ? '/src/sw/sw.ts' : appPath('sw.js');
+/** The worker controls the whole app (dev serves it from /src/sw/ with a Service-Worker-Allowed header). */
+const SW_SCOPE = import.meta.env.DEV ? '/' : BASE_PATH;
+/** Bytes the page may post ahead of what the browser's download has consumed (writes arrive as whole blocks). */
+const SW_WINDOW = 8 * 1024 * 1024;
 
 let swRegistration: Promise<ServiceWorkerRegistration> | null = null;
 
@@ -174,7 +177,7 @@ export function warmUpServiceWorker(): void {
 function ensureServiceWorker(): Promise<ServiceWorkerRegistration> {
   // Vite serves the dev worker as an ES module; the production build is a classic script.
   swRegistration ??= navigator.serviceWorker
-    .register(SW_URL, { scope: '/', type: import.meta.env.DEV ? 'module' : 'classic' })
+    .register(SW_URL, { scope: SW_SCOPE, type: import.meta.env.DEV ? 'module' : 'classic' })
     .then(() => navigator.serviceWorker.ready);
   return swRegistration;
 }
@@ -212,7 +215,7 @@ async function openServiceWorkerSink(name: string, size: number | null, mime: st
   const iframe = document.createElement('iframe');
   iframe.hidden = true;
   iframe.title = 'download';
-  iframe.src = `${SW_DOWNLOAD_PREFIX}${id}/${encodeURIComponent(name)}`;
+  iframe.src = `${appPath(SW_DOWNLOAD_PATH)}${id}/${encodeURIComponent(name)}`;
   document.body.appendChild(iframe);
 
   try {
