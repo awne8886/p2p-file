@@ -26,6 +26,28 @@ describe('parseClientMessage', () => {
     });
   });
 
+  it('carries connection-attempt ids on joins and connection ids on signals', () => {
+    expect(parseClientMessage(j({ t: 'join', code: 'x7k4q', clientId: 'abc', attempt: 'a1b2c3' }))).toEqual({
+      t: 'join',
+      code: 'x7k4q',
+      clientId: 'abc',
+      attempt: 'a1b2c3',
+    });
+    const signal = { t: 'signal', data: { kind: 'candidate', candidate: null, conn: 'c0ffee' } };
+    expect(parseClientMessage(j(signal))).toEqual(signal);
+    expect(parseClientMessage(j({ t: 'join', code: 'x7k4q', clientId: 'abc', attempt: 7 }))).toBeNull();
+    expect(
+      parseClientMessage(j({ t: 'signal', data: { kind: 'candidate', candidate: null, conn: 'x'.repeat(33) } })),
+    ).toBeNull();
+    expect(parseServerMessage(j({ t: 'peer-joined', peerId: 'p', clientId: 'c', attempt: 'a' }))).toEqual({
+      t: 'peer-joined',
+      peerId: 'p',
+      clientId: 'c',
+      attempt: 'a',
+    });
+    expect(parseServerMessage(j({ t: 'peer-joined', peerId: 'p', clientId: 'c', attempt: {} }))).toBeNull();
+  });
+
   it('rejects garbage and malformed shapes', () => {
     expect(parseClientMessage('not json')).toBeNull();
     expect(parseClientMessage(j([1, 2]))).toBeNull();

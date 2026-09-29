@@ -69,15 +69,17 @@ It runs either as one small Node process (app + signaling), or as a plain static
 - **Vite + React + TypeScript** for the client. It's a single-page app with two routes (`/` and `/<code>`), so a
   static SPA fits better than an SSR framework like Next.js. Vite also handles the Web Workers and the fixed-name
   service worker build with no extra tooling. Runtime dependencies are `react`, `react-dom`, `@noble/hashes`
-  (SHA-256 fallback for plain-`http://` LAN testing, where WebCrypto isn't available), `client-zip` (streaming zip) and `qrcode-generator`.
+  (SHA-256 fallback for plain-`http://` LAN testing, where WebCrypto isn't available), `@noble/curves` (signing Nostr
+  relay events; loaded only by the static build, on demand), `client-zip` (streaming zip) and `qrcode-generator`.
 - **Node.js + `ws`** for the signaling server rather than a Cloudflare Worker + Durable Object. One small process
   serves the built client and the WebSocket on the same origin, with no vendor lock-in. It deploys as a single Docker
   image anywhere, and in-memory rooms are the simplest correct state for short-lived codes. The trade-off is that you
   run one instance: see [Known limits](#known-limits).
-- **PeerJS as a backend-free alternative.** The static build (`npm run build:static`) signals through a PeerJS server
-  instead, by default the free public one, so the whole app can live on GitHub Pages or Cloudflare Pages.
-  `client/src/lib/peerjs.ts` plays the part of the signaling server on top of PeerJS's message relay, so the rest of
-  the app doesn't know the difference. No PeerJS library is shipped: it speaks the relay's small JSON protocol directly.
+- **Public relays as a backend-free alternative.** The static build (`npm run build:static`) signals through public
+  relays instead, so the whole app can live on GitHub Pages or Cloudflare Pages: a PeerJS server (by default the free
+  one at `0.peerjs.com`) *and* a handful of public Nostr relays, all at the same time. `client/src/lib/relay/` plays
+  the part of the signaling server on top of them, so the rest of the app doesn't know the difference. No PeerJS or
+  Nostr library is shipped: it speaks their small JSON protocols directly.
 
 ## Repository layout
 
@@ -87,7 +89,7 @@ server/   signaling server: rooms & codes, rate limiting, ICE/TURN config, stati
 client/   web app
   src/ascii/      ASCII pizza: illustration, renderer
   src/lib/        transfer engine: sender, receiver, back-pressure, block hashing, save sinks, signaling
-                  (own server or PeerJS)
+                  (own server, or public relays: src/lib/relay/)
   src/sw/         service worker for streaming downloads
   src/workers/    OPFS writer worker
   src/pages/      send + receive screens
@@ -114,7 +116,7 @@ test those.
 | -------------------------- | ------------------------------------------------------------------------------ |
 | `npm run dev`              | shared (watch) + signaling server (tsx watch) + Vite dev server                |
 | `npm run build`            | compile `shared` and `server`, bundle `client` into `client/dist`              |
-| `npm run build:static`     | bundle `client` for a static host (PeerJS signaling); see Static hosting      |
+| `npm run build:static`     | bundle `client` for a static host (relay signaling); see Static hosting       |
 | `npm start`                | production server on `$PORT` (default 8080), serving `client/dist` + `/ws`     |
 | `npm run check`            | ESLint + Prettier check + typecheck (all packages, e2e, scripts) + unit tests  |
 | `npm test`                 | Vitest unit tests (short codes, protocol validation, rooms, back-pressure…)    |
@@ -138,7 +140,9 @@ The e2e suite starts the production server on a free port and runs real WebRTC t
 - static rendering under reduced motion; the 404 page's spinning whole pizza (and its 404 status)
 - mobile layout with no horizontal overflow
 - the static build, served like GitHub Pages under `/p2p-file/` with the 404.html fallback, with a local PeerJS
-  server: a service-worker download, a resume after a dropped connection, and an expired link
+  server and a local Nostr relay: a service-worker download, a resume after a dropped connection, a link nobody is
+  sharing; a PeerJS server that drops every connection as soon as it relays a message (Nostr carries the transfer),
+  the Nostr relays down (PeerJS carries it), and both broken (the receiver says so instead of spinning)
 
 Set `CHROMIUM_PATH` to point at a Chromium binary and `E2E_BIG_MB` to change the large-file size.
 
@@ -186,10 +190,17 @@ Health check: `GET /healthz` → `{"ok":true,"rooms":…,"receivers":…}`.
 
 ### Static hosting (GitHub Pages, Cloudflare Pages)
 
-A static host can't run the WebSocket signaling server, so `npm run build:static` makes a build that signals through a
-[PeerJS](https://peerjs.com) server instead: by default the free public one at `0.peerjs.com`. Everything else is
-identical: the files still go directly between browsers, block-verified, and the PeerJS server only relays the
-connection setup (it never sees file names or contents).
+A static host can't run the WebSocket signaling server, so `npm run build:static` makes a build that signals through
+public relays instead: the free [PeerJS](https://peerjs.com) server at `0.peerjs.com` and five public
+[Nostr](https://nostr.com) relays, **all at once**. Every signaling message goes out on every relay that's connected,
+and the first copy to arrive wins, so one relay being slow, down, or dropping connections doesn't stop anything (free
+public relays do all three). Everything else is identical: the files still go directly between browsers,
+block-verified, and the relays only carry the connection setup.
+
+Signaling through public relays is **end-to-end encrypted**. Both browsers derive, from the share code alone, a room
+name and an AES-GCM key (PBKDF2, 200 000 rounds). Relays only see the room name: never the code, file names, IP
+addresses or the connection's DTLS fingerprints, and they can't forge or alter a message, so they can't slip
+themselves into the connection either.
 
 **GitHub Pages** (`https://<user>.github.io/<repo>/`):
 
@@ -216,19 +227,40 @@ links from `404.html`, so they arrive with an HTTP 404 status; browsers don't ca
 Cloudflare Pages treats a site without a `404.html` as a single-page app and serves `index.html` for every path, so
 links are plain `https://drop.example.com/x7k4q` with a 200 status. Don't add the 404.html copy there.
 
-**Trade-offs of the public PeerJS server**, compared with running `server/`:
-- It's a free community service with no uptime guarantee. If it's down, nobody can start a transfer (running
-  transfers aren't affected). `VITE_PEERJS_URL` points the build at another PeerJS server, e.g. your own
-  (`npx peer --port 9000`), and `VITE_SIGNAL_URL` at a PizzaDrop server (`server/`) running somewhere else.
-- It can't rate-limit joins the way `server/` does, so codes are 6 characters (≈ 887 M combinations) instead of 5.
-- As with any signaling server, you trust its operator not to tamper with the connection setup (see
-  [Known limits](#known-limits)).
-- There's no TURN relay unless you add one with `VITE_ICE_SERVERS`, so two peers that are both behind strict NATs
-  can't connect. In a public static site, TURN credentials are visible to anyone, so use a TURN service meant for
-  that, or one with short-lived credentials.
+**Trade-offs of public relays**, compared with running `server/`:
+- They're free community services with no uptime guarantee. Using several at once makes an outage of any one of them
+  harmless, but if every one is unreachable from a network (some office firewalls block WebSockets), nobody there can
+  start a transfer; running transfers aren't affected. `VITE_PEERJS_URL` and `VITE_NOSTR_RELAYS` point the build at
+  other relays (e.g. your own PeerJS server, `npx peer --port 9000`), and `VITE_SIGNAL_URL` at a PizzaDrop server
+  (`server/`) running somewhere else.
+- They can't rate-limit joins the way `server/` does, so codes are 6 characters (≈ 887 M combinations) instead of 5.
+- The relays can't read or tamper with the connection setup (see above), but they do see *when* someone shares and
+  connects, and from which IP address the WebSocket comes.
+- There's no TURN relay unless you add one (see [Connection problems](#connection-problems)), so two peers that are
+  both behind strict NATs can't connect.
 
 The workflow reads these as repository **variables** (Settings → Secrets and variables → Actions → Variables):
-`SIGNAL_URL`, `PEERJS_URL`, `PEERJS_KEY`, `ICE_SERVERS`, `PUBLIC_URL`.
+`SIGNAL_URL`, `PEERJS_URL`, `PEERJS_KEY`, `NOSTR_RELAYS`, `ICE_SERVERS`, `ICE_SERVERS_URL`, `PUBLIC_URL`.
+
+### Connection problems
+
+Connecting has three steps, and the receiver's page says which one it's on and, if one fails, which one and why. It
+never just spins: each step has a time limit (counted while the page is on screen), and a failed direct connection is
+retried once with a fresh one.
+
+| The receiver sees                                           | What it means / what to do                                                                                                                                                                                                  |
+| ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| *Reaching the signaling server…* → **Something went wrong** | No signaling server or relay could be reached from this network (after 20 s). Check the connection; some firewalls block WebSockets.                                                                                        |
+| *Looking for the sender…* → **Couldn't find the sender**    | Nobody answered for that code (after 12 s): the link expired, or the sender's tab was closed or asleep. Phones pause background tabs, so the sender should keep PizzaDrop on screen until the receiver has connected. |
+| *Found the sender…* → **Couldn't connect to the sender**    | The two browsers couldn't reach each other directly (twice, 20 s each). Some networks block peer-to-peer traffic: guest/office Wi-Fi with client isolation, VPNs, some mobile carriers. A TURN relay fixes it (below).     |
+
+**Adding TURN to the static build.** TURN relays the (still encrypted) traffic when a direct path is impossible. Its
+credentials end up in the browser, so use a service with short-lived credentials: e.g. [Metered](https://www.metered.ca/tools/openrelay/)'s
+free tier gives you a URL like `https://<app>.metered.live/api/v1/turn/credentials?apiKey=<key>` that returns them.
+Set it as the `ICE_SERVERS_URL` repository variable (or `VITE_ICE_SERVERS_URL` at build time): the page fetches it at
+startup and adds the servers it returns (the Content-Security-Policy allows that origin automatically). Or set
+`ICE_SERVERS` to a fixed JSON array of `RTCIceServer` objects. For `server/`, see
+[Adding a TURN server](#adding-a-turn-server-coturn).
 
 ## Environment variables
 
@@ -240,13 +272,15 @@ Read by Vite when bundling the client; `client/.env.static` holds the defaults f
 | ------------------- | -------------------------------- | ------------------------------------------------------------------------------ |
 | `BASE_PATH`         | `/`                              | Path the site is served under, e.g. `/p2p-file/` for a GitHub Pages project    |
 | `OUT_DIR`           | `client/dist`                    | Where the build goes                                                           |
-| `VITE_SIGNALING`    | `server` (`peerjs` when static)  | `server`: PizzaDrop's own signaling server. `peerjs`: a PeerJS server          |
-| `VITE_SIGNAL_URL`   | `/ws` on the page's origin       | WebSocket URL of a PizzaDrop signaling server hosted elsewhere                 |
-| `VITE_PEERJS_URL`   | `wss://0.peerjs.com/peerjs`      | PeerJS server WebSocket endpoint                                               |
-| `VITE_PEERJS_KEY`   | `peerjs`                         | PeerJS server key                                                              |
-| `VITE_ICE_SERVERS`  | Google + Cloudflare STUN         | JSON array of `RTCIceServer` objects (PeerJS mode; `server/` sends its own)    |
-| `VITE_PUBLIC_URL`   | _(page origin)_                  | Origin for share links, e.g. `https://drop.example.com`                        |
-| `VITE_CODE_LENGTH`  | `6`                              | Share-code length in PeerJS mode (5 or 6)                                      |
+| `VITE_SIGNALING`       | `server` (`relays` when static)  | `server`: PizzaDrop's own signaling server. `relays` (old name `peerjs`): public relays |
+| `VITE_SIGNAL_URL`      | `/ws` on the page's origin       | WebSocket URL of a PizzaDrop signaling server hosted elsewhere                 |
+| `VITE_PEERJS_URL`      | `wss://0.peerjs.com/peerjs`      | PeerJS server WebSocket endpoint; `none` to not use PeerJS                     |
+| `VITE_PEERJS_KEY`      | `peerjs`                         | PeerJS server key                                                              |
+| `VITE_NOSTR_RELAYS`    | five public relays               | Comma-separated Nostr relay URLs; `none` to not use Nostr                      |
+| `VITE_ICE_SERVERS`     | Google + Cloudflare STUN         | JSON array of `RTCIceServer` objects (relay mode; `server/` sends its own)     |
+| `VITE_ICE_SERVERS_URL` | _(none)_                         | URL returning more `RTCIceServer`s at startup, e.g. TURN credentials           |
+| `VITE_PUBLIC_URL`      | _(page origin)_                  | Origin for share links, e.g. `https://drop.example.com`                        |
+| `VITE_CODE_LENGTH`     | `6`                              | Share-code length in relay mode (5 or 6)                                       |
 
 ### Server (`server/`)
 
@@ -326,8 +360,9 @@ Firefox private windows disable service workers and OPFS, so they fall back to i
   cheap.
 - **Trust model.** The SHA-256 check catches corruption and bugs. It can't catch a malicious sender, who controls
   both the file and the hash. As in any WebRTC app, the data channel's DTLS fingerprints travel via the signaling
-  server, so you're trusting whoever runs that server not to swap them. Anyone with the link can download while the
-  tab is open, so treat the link like the file.
+  server, so you're trusting whoever runs that server not to swap them (in the static build, signaling is sealed with
+  a key derived from the share code, so public relays can't). Anyone with the link can download while the tab is
+  open, so treat the link like the file.
 
 ---
 

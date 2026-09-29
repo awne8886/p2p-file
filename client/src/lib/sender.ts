@@ -12,6 +12,7 @@ import { shareUrl } from './config';
 import { BLOCK_SIZE, CHUNK_SIZE, CONNECT_TIMEOUT_MS, HIGH_WATER, LOW_WATER, WINDOW } from './constants';
 import { sha256Hex } from './digest';
 import { ChannelClosedError, Notifier, streamBlob, type Credit } from './flow';
+import { randomId } from './ids';
 import { PeerLink } from './rtc';
 import { createSignaling, type Signaling } from './signaling';
 import { SpeedMeter } from './speed';
@@ -158,6 +159,12 @@ export class Host {
     return this.entries[id];
   }
 
+  /** ICE servers for a new connection, once any TURN credentials have loaded. */
+  async iceServers(): Promise<RTCIceServer[]> {
+    await this.signaling.iceReady;
+    return this.signaling.iceServers;
+  }
+
   private append(files: readonly File[]): void {
     for (const file of files) {
       const id = this.entries.length;
@@ -193,7 +200,7 @@ export class Host {
         this.emit();
         return;
       case 'peer-joined':
-        this.addPeer(msg.peerId, msg.clientId);
+        this.addPeer(msg.peerId, msg.clientId, msg.attempt);
         return;
       case 'peer-left': {
         // Only the receiver's signaling socket is gone. An established
@@ -231,8 +238,15 @@ export class Host {
     }
   }
 
-  private addPeer(peerId: string, clientId: string): void {
+  private addPeer(peerId: string, clientId: string, attempt?: string): void {
     let row = this.rows.get(clientId);
+    const current = row?.link;
+    if (current && current.peerId === peerId && attempt !== undefined && current.attempt === attempt && current.alive) {
+      // The same connection attempt asking again: its join was repeated because a relay may have lost it (or our
+      // offer). Starting over would throw away a connection that may be nearly up, so resend the offer instead.
+      if (!current.connected) current.resendOffer();
+      return;
+    }
     if (row) {
       // Same browser tab reconnecting (e.g. after a network blip): replace its old connection.
       row.link?.close();
@@ -251,7 +265,7 @@ export class Host {
       };
       this.rows.set(clientId, row);
     }
-    const link = new Outgoing(this, row, this.signaling.iceServers, (data) =>
+    const link = new Outgoing(this, row, peerId, attempt, (data) =>
       this.signaling.send({ t: 'signal', to: peerId, data }),
     );
     row.link = link;
@@ -300,7 +314,9 @@ export class Host {
 
 /** One receiver's peer connection, data channel and send loop. */
 class Outgoing {
-  private readonly link: PeerLink;
+  private link: PeerLink | null = null;
+  /** Names this connection attempt in every signal (see `PeerLink`). */
+  private readonly conn = randomId(6);
   private dc: RTCDataChannel | null = null;
   private readonly changed = new Notifier();
   /** Flow control for everything sent on this channel, across files and requests. */
@@ -316,17 +332,35 @@ class Outgoing {
   constructor(
     private readonly host: Host,
     readonly row: Row,
-    iceServers: RTCIceServer[],
-    sendSignal: (data: SignalPayload) => void,
-  ) {
-    this.link = new PeerLink(iceServers, sendSignal);
-    this.link.pc.onconnectionstatechange = () => {
-      if (this.link.pc.connectionState === 'failed') this.fail('The connection to this receiver failed.');
-    };
+    /** The receiver's signaling id, and the attempt it joined with (see `Host.addPeer`). */
+    readonly peerId: string,
+    readonly attempt: string | undefined,
+    private readonly sendSignal: (data: SignalPayload) => void,
+  ) {}
+
+  /** Not closed or failed. */
+  get alive(): boolean {
+    return !this.closed;
   }
 
   start(): void {
-    const dc = this.link.pc.createDataChannel(DATA_CHANNEL_LABEL, { ordered: true });
+    this.connectTimer = setTimeout(() => {
+      if (!this.connected) {
+        this.fail("Couldn't connect directly to this receiver (a firewall or strict NAT may be in the way).");
+      }
+    }, CONNECT_TIMEOUT_MS);
+    void this.host.iceServers().then((iceServers) => {
+      if (!this.closed) this.open(iceServers);
+    });
+  }
+
+  private open(iceServers: RTCIceServer[]): void {
+    const link = new PeerLink(iceServers, this.conn, this.sendSignal);
+    this.link = link;
+    link.pc.onconnectionstatechange = () => {
+      if (link.pc.connectionState === 'failed') this.fail('The connection to this receiver failed.');
+    };
+    const dc = link.pc.createDataChannel(DATA_CHANNEL_LABEL, { ordered: true });
     dc.binaryType = 'arraybuffer';
     dc.bufferedAmountLowThreshold = LOW_WATER;
     dc.onopen = () => {
@@ -343,18 +377,17 @@ class Outgoing {
     };
     dc.onclose = () => this.close();
     this.dc = dc;
-
-    this.connectTimer = setTimeout(() => {
-      if (!this.connected) {
-        this.fail("Couldn't connect directly to this receiver (a firewall or strict NAT may be in the way).");
-      }
-    }, CONNECT_TIMEOUT_MS);
-
-    this.link.offer().catch((err: unknown) => this.fail(`Could not start the connection: ${String(err)}`));
+    link.offer().catch((err: unknown) => this.fail(`Could not start the connection: ${String(err)}`));
   }
 
   handleSignal(data: SignalPayload): Promise<void> {
+    if (!this.link) return Promise.resolve();
     return this.link.handleSignal(data).catch((err: unknown) => console.warn('[sender] signal error', err));
+  }
+
+  /** Send the offer again (the receiver asked again, so it may never have arrived). */
+  resendOffer(): void {
+    this.link?.resendDescription();
   }
 
   sendManifest(): void {
@@ -423,7 +456,7 @@ class Outgoing {
     this.setProgress(req.written, req.total, true);
     this.setStatus('receiving');
 
-    const maxMessage = this.link.pc.sctp?.maxMessageSize ?? 0;
+    const maxMessage = this.link?.pc.sctp?.maxMessageSize ?? 0;
     const chunkSize = maxMessage > 0 ? Math.min(CHUNK_SIZE, maxMessage) : CHUNK_SIZE;
 
     for (let i = 0; i < entries.length; i++) {
@@ -527,7 +560,7 @@ class Outgoing {
       this.dc.onmessage = null;
       this.dc.close();
     }
-    this.link.close();
+    this.link?.close();
     if (this.row.link === this && (this.row.status === 'receiving' || this.row.status === 'connected')) {
       this.row.status = 'disconnected';
       this.host.emit();

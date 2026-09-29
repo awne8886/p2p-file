@@ -1,6 +1,6 @@
 import { fileURLToPath, URL } from 'node:url';
 import react from '@vitejs/plugin-react';
-import { defineConfig, type Plugin } from 'vite';
+import { defineConfig, loadEnv, type Plugin } from 'vite';
 
 const SIGNAL_TARGET = process.env.SIGNAL_TARGET ?? 'http://localhost:8080';
 
@@ -18,25 +18,38 @@ function basePath(): string {
  * The same Content-Security-Policy the Node server sends as a header, as a
  * <meta> tag so static hosts (GitHub Pages, Cloudflare Pages) get it too.
  * `frame-ancestors` only works as a header, so it isn't repeated here.
+ * `extraConnect` lets the page fetch TURN credentials (VITE_ICE_SERVERS_URL).
  */
-const CSP = [
-  "default-src 'self'",
-  "script-src 'self'",
-  "style-src 'self' 'unsafe-inline'",
-  "img-src 'self' data: blob:",
-  "connect-src 'self' ws: wss:",
-  "worker-src 'self' blob:",
-  "frame-src 'self'",
-  "object-src 'none'",
-  "base-uri 'none'",
-  "form-action 'none'",
-].join('; ');
+function csp(extraConnect: string[]): string {
+  return [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob:",
+    ["connect-src 'self' ws: wss:", ...extraConnect].join(' '),
+    "worker-src 'self' blob:",
+    "frame-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'none'",
+  ].join('; ');
+}
 
-const cspMeta = (): Plugin => ({
+/** The origin of `url`, if it is an http(s) URL. */
+function originOf(url: string | undefined): string[] {
+  try {
+    const u = new URL(url ?? '');
+    return u.protocol === 'https:' || u.protocol === 'http:' ? [u.origin] : [];
+  } catch {
+    return [];
+  }
+}
+
+const cspMeta = (content: string): Plugin => ({
   name: 'pizzadrop:csp-meta',
   apply: 'build',
   transformIndexHtml: () => [
-    { tag: 'meta', attrs: { 'http-equiv': 'Content-Security-Policy', content: CSP }, injectTo: 'head-prepend' },
+    { tag: 'meta', attrs: { 'http-equiv': 'Content-Security-Policy', content }, injectTo: 'head-prepend' },
   ],
 });
 
@@ -51,9 +64,13 @@ const devServiceWorkerScope = (): Plugin => ({
   },
 });
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   base: basePath(),
-  plugins: [react(), devServiceWorkerScope(), cspMeta()],
+  plugins: [
+    react(),
+    devServiceWorkerScope(),
+    cspMeta(csp(originOf(loadEnv(mode, fileURLToPath(new URL('.', import.meta.url)), 'VITE_').VITE_ICE_SERVERS_URL))),
+  ],
   resolve: {
     alias: {
       '@pizzadrop/shared': fileURLToPath(new URL('../shared/src/index.ts', import.meta.url)),
@@ -85,4 +102,4 @@ export default defineConfig({
       },
     },
   },
-});
+}));
