@@ -1,0 +1,11 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "WebWorker"],
+    "types": [],
+    "noEmit": true
+  },
+  "include": ["src/workers", "src/sw", "src/lib/hashProtocol.ts", "src/lib/swProtocol.ts", "src/lib/opfsProtocol.ts"]
+}
