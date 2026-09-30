@@ -486,7 +486,7 @@ The difference is that here the colours come from a pizza.
    - With `prefers-reduced-motion` it renders one static frame.
    - Dragging a file over the page makes the waves speed up and brighten a little. An active transfer does the same,
      more gently, and drops the frame rate to 30 fps to leave the CPU to the transfer.
-6. **The 404 page** draws a whole pizza (`drawWholePizza`) in the same style, turning clockwise once every 90 s. The
+6. **The 404 page** draws a whole pizza (`drawWholePizza`) in the same style, turning clockwise once every 60 s. The
    glyph grid can't rotate (the glyphs have to stay upright), so the illustration is rasterised once into a 320×320
    map of materials, and every frame each cell looks up which part of the turning pizza is under it. A circle's
    outline doesn't change as it turns, so layout and star placement still happen once per resize. The Node server
