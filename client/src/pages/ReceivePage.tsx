@@ -5,7 +5,7 @@ import { useBeforeUnload } from '../hooks/useBeforeUnload';
 import { useSideLayout } from '../hooks/useSideLayout';
 import { BASE_PATH } from '../lib/config';
 import { BLOB_WARN_BYTES } from '../lib/constants';
-import { Receiver, type ReceiveSnapshot } from '../lib/receiver';
+import { Receiver, type ConnectPhase, type ReceiveErrorKind, type ReceiveSnapshot } from '../lib/receiver';
 import {
   cleanUpStagedDownloads,
   NeedsMemoryConfirmationError,
@@ -24,6 +24,27 @@ interface Props {
 }
 
 const SPINNER = ['|', '/', '-', '\\'];
+
+const PHASES: Record<ConnectPhase, string> = {
+  signaling: 'Reaching the signaling server…',
+  looking: 'Looking for the sender…',
+  negotiating: 'Found the sender. Opening a direct, encrypted connection between your browsers…',
+};
+
+const ERROR_TITLES: Partial<Record<ReceiveErrorKind, string>> = {
+  'not-found': 'This link has expired.',
+  'no-sender': 'Couldn’t find the sender.',
+  unreachable: 'Couldn’t connect to the sender.',
+  integrity: 'Integrity check failed.',
+  cancelled: 'Download cancelled.',
+};
+
+/** What connecting is doing right now, so a slow step is visible instead of an endless spinner. */
+function connectDetail(s: ReceiveSnapshot | null): string {
+  if (!s?.connect) return 'Setting up a direct, encrypted connection between your browser and theirs.';
+  const retry = s.connect.attempt > 1 ? ` (attempt ${s.connect.attempt})` : '';
+  return PHASES[s.connect.phase] + retry;
+}
 
 function useSpinner(active: boolean): string {
   const [i, setI] = useState(0);
@@ -142,7 +163,9 @@ export function ReceivePage({ code, setEnergy, setTransferring }: Props) {
               </span>{' '}
               connecting to the sender…
             </p>
-            <p className="fine">Setting up a direct, encrypted connection between your browser and theirs.</p>
+            <p className="fine" data-testid="connect-phase" data-phase={snap?.connect?.phase ?? ''}>
+              {connectDetail(snap)}
+            </p>
           </>
         )}
 
@@ -247,15 +270,7 @@ export function ReceivePage({ code, setEnergy, setTransferring }: Props) {
 
         {status === 'error' && snap?.error && (
           <div className="error" role="alert" data-testid="receive-error" data-kind={snap.error.kind}>
-            <p className="error__title">
-              {snap.error.kind === 'not-found'
-                ? 'This link has expired.'
-                : snap.error.kind === 'integrity'
-                  ? 'Integrity check failed.'
-                  : snap.error.kind === 'cancelled'
-                    ? 'Download cancelled.'
-                    : 'Something went wrong.'}
-            </p>
+            <p className="error__title">{ERROR_TITLES[snap.error.kind] ?? 'Something went wrong.'}</p>
             <p className="fine">{snap.error.message}</p>
             <div className="row">
               {snap.error.kind !== 'not-found' && (

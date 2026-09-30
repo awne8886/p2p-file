@@ -3,11 +3,14 @@
 # One-time setup: Settings → Pages → Build and deployment → Source: "GitHub Actions".
 #
 # Optional repository variables (Settings → Secrets and variables → Actions → Variables):
-#   SIGNAL_URL   wss:// URL of your own PizzaDrop signaling server (server/). Unset: the public PeerJS server.
-#   PEERJS_URL   Another PeerJS server's WebSocket endpoint, e.g. wss://peer.example.com/peerjs
-#   PEERJS_KEY   That server's key (default "peerjs").
-#   ICE_SERVERS  JSON array of RTCIceServer objects, e.g. to add a TURN server.
-#   PUBLIC_URL   Origin for share links if you use a custom domain, e.g. https://drop.example.com
+#   SIGNAL_URL       wss:// URL of your own PizzaDrop signaling server (server/). Unset: public relays.
+#   PEERJS_URL       Another PeerJS server's WebSocket endpoint, e.g. wss://peer.example.com/peerjs ("none": off).
+#   PEERJS_KEY       That server's key (default "peerjs").
+#   NOSTR_RELAYS     Comma-separated Nostr relay URLs instead of the defaults ("none": off).
+#   ICE_SERVERS      JSON array of RTCIceServer objects, e.g. to add a TURN server.
+#   ICE_SERVERS_URL  URL that returns TURN credentials at startup, e.g. Metered's
+#                    https://<app>.metered.live/api/v1/turn/credentials?apiKey=<key>
+#   PUBLIC_URL       Origin for share links if you use a custom domain, e.g. https://drop.example.com
 name: Deploy to GitHub Pages
 
 on:
@@ -50,11 +53,13 @@ jobs:
           # "/p2p-file" for a project site, "" with a custom domain.
           BASE_PATH: ${{ steps.pages.outputs.base_path }}
           OUT_DIR: ${{ github.workspace }}/_site
-          VITE_SIGNALING: ${{ vars.SIGNAL_URL && 'server' || 'peerjs' }}
+          VITE_SIGNALING: ${{ vars.SIGNAL_URL && 'server' || 'relays' }}
           VITE_SIGNAL_URL: ${{ vars.SIGNAL_URL }}
           VITE_PEERJS_URL: ${{ vars.PEERJS_URL }}
           VITE_PEERJS_KEY: ${{ vars.PEERJS_KEY }}
+          VITE_NOSTR_RELAYS: ${{ vars.NOSTR_RELAYS }}
           VITE_ICE_SERVERS: ${{ vars.ICE_SERVERS }}
+          VITE_ICE_SERVERS_URL: ${{ vars.ICE_SERVERS_URL }}
           VITE_PUBLIC_URL: ${{ vars.PUBLIC_URL }}
 
       # GitHub Pages has no rewrites: unknown paths such as /p2p-file/x7k4q get 404.html,

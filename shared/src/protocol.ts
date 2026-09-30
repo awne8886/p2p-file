@@ -40,9 +40,13 @@ export interface IceCandidatePayload {
   usernameFragment: string | null;
 }
 
+/**
+ * A WebRTC session description or ICE candidate. `conn` names the peer connection it belongs to (the sender picks
+ * one per connection attempt), so a repeated, late or out-of-order signal can't be applied to the wrong connection.
+ */
 export type SignalPayload =
-  | { kind: 'description'; description: SessionDescriptionPayload }
-  | { kind: 'candidate'; candidate: IceCandidatePayload | null };
+  | { kind: 'description'; description: SessionDescriptionPayload; conn?: string }
+  | { kind: 'candidate'; candidate: IceCandidatePayload | null; conn?: string };
 
 export interface PeerInfo {
   peerId: string;
@@ -63,8 +67,11 @@ export type ErrorCode =
 export type ClientMessage =
   /** Sender asks for a share code, or reclaims one after a dropped socket. */
   | { t: 'host'; resume?: { code: string; token: string } }
-  /** Receiver asks to be introduced to the sender behind `code`. */
-  | { t: 'join'; code: string; clientId: string }
+  /**
+   * Receiver asks to be introduced to the sender behind `code`. `attempt` names one connection attempt: a join
+   * repeated with the same attempt (because the first one may have been lost) doesn't restart the connection.
+   */
+  | { t: 'join'; code: string; clientId: string; attempt?: string }
   /** Relay a WebRTC payload. Senders must set `to`; receivers always talk to their sender. */
   | { t: 'signal'; to?: string; data: SignalPayload }
   /** Sender stops sharing: the code is released immediately. */
@@ -77,7 +84,7 @@ export type ServerMessage =
   | { t: 'hello'; version: number; iceServers: IceServerConfig[]; publicUrl: string | null }
   | { t: 'hosted'; code: string; token: string; expiresAt: number; peers: PeerInfo[] }
   | { t: 'joined'; peerId: string }
-  | { t: 'peer-joined'; peerId: string; clientId: string }
+  | { t: 'peer-joined'; peerId: string; clientId: string; attempt?: string }
   | { t: 'peer-left'; peerId: string }
   | { t: 'signal'; from?: string; data: SignalPayload }
   /** Sent to receivers when the sender's code is gone (tab closed, stopped, or expired). */
@@ -152,8 +159,10 @@ function parseJson(raw: unknown): Obj | null {
 /** SDP is a few KB in practice; anything much larger is abuse. */
 const MAX_SDP = 32 * 1024;
 
+const isOptStr = (v: unknown, max: number): boolean => v === undefined || isStr(v, max);
+
 export function isSignalPayload(v: unknown): v is SignalPayload {
-  if (!isObj(v)) return false;
+  if (!isObj(v) || !isOptStr(v.conn, 32)) return false;
   if (v.kind === 'description') {
     const d = v.description;
     return isObj(d) && (d.type === 'offer' || d.type === 'answer') && isStr(d.sdp, MAX_SDP);
@@ -185,9 +194,12 @@ export function parseClientMessage(raw: unknown): ClientMessage | null {
       return null;
     }
     case 'join':
-      return isStr(m.code, 16) && isStr(m.clientId, 64) && m.clientId.length > 0
+      if (!isStr(m.code, 16) || !isStr(m.clientId, 64) || m.clientId.length === 0 || !isOptStr(m.attempt, 32)) {
+        return null;
+      }
+      return m.attempt === undefined
         ? { t: 'join', code: m.code, clientId: m.clientId }
-        : null;
+        : { t: 'join', code: m.code, clientId: m.clientId, attempt: m.attempt as string };
     case 'signal':
       if (!isSignalPayload(m.data)) return null;
       if (m.to === undefined) return { t: 'signal', data: m.data };
@@ -231,7 +243,10 @@ export function parseServerMessage(raw: unknown): ServerMessage | null {
     case 'joined':
       return isStr(m.peerId) ? { t: 'joined', peerId: m.peerId } : null;
     case 'peer-joined':
-      return isStr(m.peerId) && isStr(m.clientId) ? { t: 'peer-joined', peerId: m.peerId, clientId: m.clientId } : null;
+      if (!isStr(m.peerId) || !isStr(m.clientId) || !isOptStr(m.attempt, 32)) return null;
+      return m.attempt === undefined
+        ? { t: 'peer-joined', peerId: m.peerId, clientId: m.clientId }
+        : { t: 'peer-joined', peerId: m.peerId, clientId: m.clientId, attempt: m.attempt as string };
     case 'peer-left':
       return isStr(m.peerId) ? { t: 'peer-left', peerId: m.peerId } : null;
     case 'signal':

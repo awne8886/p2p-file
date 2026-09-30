@@ -42,8 +42,31 @@ export const ACK_EVERY = 1 * MiB;
 /** Above this, the in-memory Blob fallback shows a warning before starting. */
 export const BLOB_WARN_BYTES = 500 * 1000 * 1000;
 
-/** Receiver gives up connecting to the sender after this long. */
+/** Sender gives up on a receiver whose peer connection hasn't opened after this long. */
 export const CONNECT_TIMEOUT_MS = 25_000;
+
+/*
+ * Receiver: connecting to the sender goes through phases, each with its own limit, so it always ends in either a
+ * connection or an error that says which step failed. Limits count time while the page is visible (a phone that
+ * locks its screen mid-connection shouldn't come back to an error), and repeating a step never resets them.
+ */
+
+/** Reaching a signaling server (or any relay). */
+export const SIGNALING_TIMEOUT_MS = 20_000;
+/** Waiting for the sender to answer a join. The sender replies at once when its tab is open and awake. */
+export const LOOKING_TIMEOUT_MS = 12_000;
+/** The same, when reconnecting mid-download: the sender's own connection may be recovering too. */
+export const RELOOKING_TIMEOUT_MS = 30_000;
+/** Repeat an unanswered join this often: a relay may have lost it. */
+export const JOIN_RETRY_MS = 3_000;
+/** One peer connection getting from offer to open data channel (and the file list). */
+export const NEGOTIATE_TIMEOUT_MS = 20_000;
+/** Fresh peer connections tried before concluding the two browsers can't reach each other. */
+export const MAX_CONNECT_ATTEMPTS = 2;
+/** The same mid-download, where the network may still be settling (e.g. Wi-Fi handing over to mobile data). */
+export const MAX_RECONNECT_ATTEMPTS = 4;
+/** Everything together, however the phases went: a hard stop (doubled when reconnecting mid-download). */
+export const CONNECT_BUDGET_MS = 90_000;
 
 /** Reconnection attempts after a receiver's connection drops mid-transfer. */
 export const MAX_RECONNECTS = 5;

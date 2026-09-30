@@ -6,13 +6,21 @@ import {
   type ReceiverMessage,
   type SenderMessage,
   type ServerMessage,
+  type SignalPayload,
 } from '@pizzadrop/shared';
 import {
   ACK_EVERY,
-  CONNECT_TIMEOUT_MS,
+  CONNECT_BUDGET_MS,
+  JOIN_RETRY_MS,
+  LOOKING_TIMEOUT_MS,
   MAX_BLOCK_RETRIES,
+  MAX_CONNECT_ATTEMPTS,
+  MAX_RECONNECT_ATTEMPTS,
   MAX_RECONNECTS,
   MAX_STALL_RECOVERIES,
+  NEGOTIATE_TIMEOUT_MS,
+  RELOOKING_TIMEOUT_MS,
+  SIGNALING_TIMEOUT_MS,
   STALL_MS,
 } from './constants';
 import { sha256Hex } from './digest';
@@ -27,7 +35,13 @@ import { SpeedMeter } from './speed';
 export type ReceiveStatus = 'connecting' | 'ready' | 'receiving' | 'reconnecting' | 'finishing' | 'done' | 'error';
 
 export type ReceiveErrorKind =
-  'not-found' | 'host-left' | 'unreachable' | 'integrity' | 'sender' | 'save' | 'network' | 'cancelled';
+  'not-found' | 'no-sender' | 'host-left' | 'unreachable' | 'integrity' | 'sender' | 'save' | 'network' | 'cancelled';
+
+/**
+ * Where connecting to the sender has got to: reaching a signaling server, waiting for the sender to answer, then
+ * opening the direct connection between the two browsers.
+ */
+export type ConnectPhase = 'signaling' | 'looking' | 'negotiating';
 
 export interface BatchSnapshot {
   /** 1 for the first download from this share, 2 for the next… */
@@ -61,6 +75,8 @@ export interface ReceiveSnapshot {
   repaired: number;
   /** The sender stopped sharing after we finished (not an error: everything we asked for arrived). */
   hostGone: boolean;
+  /** While (re)connecting: the current step, and which fresh connection attempt this is (1, 2…). */
+  connect: { phase: ConnectPhase; attempt: number } | null;
   error: { kind: ReceiveErrorKind; message: string } | null;
 }
 
@@ -72,6 +88,9 @@ export interface DownloadPlan {
   size: number;
   mime: string;
 }
+
+const UNREACHABLE =
+  'Found the sender, but your two browsers couldn’t open a direct connection. Some networks block this (guest or office Wi-Fi, VPNs, some mobile carriers). Try again, or put one device on a different network, e.g. mobile data. The site owner can make this always work by adding a TURN relay.';
 
 /** Stable per-tab id so the sender can recognise us when we reconnect. */
 function tabClientId(): string {
@@ -159,8 +178,27 @@ export class Receiver {
   private verifying: Promise<void> = Promise.resolve();
   private readonly retries = new Map<string, number>();
 
-  private connectTimer: ReturnType<typeof setTimeout> | undefined;
+  // Connecting (see ConnectPhase and the limits in constants.ts).
+  private connecting = false;
+  private phase: ConnectPhase = 'signaling';
+  /** Visible time spent in this phase / in this whole (re)connection. */
+  private phaseMs = 0;
+  private episodeMs = 0;
+  private rejoining = false;
+  /** Fresh peer connections tried in this (re)connection, and the id of the current one. */
+  private attempts = 0;
+  private attempt = '';
+  private lastJoinAt = 0;
+  private ticker: ReturnType<typeof setInterval> | undefined;
+  /** An offer we're answering while ICE servers load. */
+  private linkPending: string | null = null;
+  /** Candidates for a connection whose offer hasn't arrived yet: relays can deliver out of order. */
+  private early: SignalPayload[] = [];
   private reconnects = 0;
+  private readonly onVisible = () => {
+    // Back in the foreground: don't wait for the next retry to ask again.
+    if (document.visibilityState === 'visible' && this.connecting && this.phase === 'looking') this.sendJoin();
+  };
   /** Bumped by anything that counts as progress: a chunk arriving, a check finishing, a write. */
   private activity = 0;
   private watchdog: ReturnType<typeof setInterval> | undefined;
@@ -175,13 +213,19 @@ export class Receiver {
       onReady: () => {
         // Only (re)join when we actually need a peer connection: re-joining
         // while the data channel is healthy would make the sender replace it.
-        if (!this.isChannelOpen && !this.isFinal && !this.hostGone) this.join();
+        if (this.isChannelOpen || this.isFinal || this.hostGone) return;
+        if (!this.connecting) this.beginConnect(false);
+        if (this.phase === 'signaling' && this.signaling.isOpen) this.setPhase('looking');
+        // Sent even before a relay is up: it goes out as soon as one is.
+        this.sendJoin();
       },
       onMessage: (msg) => this.onSignal(msg),
     });
   }
 
   connect(): void {
+    document.addEventListener('visibilitychange', this.onVisible);
+    this.beginConnect(false);
     this.signaling.connect();
     this.emit();
   }
@@ -253,8 +297,9 @@ export class Receiver {
   /** Tear everything down (component unmount). */
   destroy(): void {
     this.destroyed = true;
+    document.removeEventListener('visibilitychange', this.onVisible);
     clearInterval(this.watchdog);
-    clearTimeout(this.connectTimer);
+    this.endConnect();
     clearTimeout(this.emitTimer);
     this.signaling.send({ t: 'leave' });
     this.signaling.close();
@@ -283,41 +328,129 @@ export class Receiver {
 
   // ─── Signaling / connection ─────────────────────────────────────────────
 
-  private join(): void {
-    this.signaling.send({ t: 'join', code: this.code, clientId: this.clientId });
-    clearTimeout(this.connectTimer);
-    this.connectTimer = setTimeout(() => {
-      if (this.isChannelOpen || this.isFinal) return;
-      if (this.status === 'done') {
-        this.hostGone = true;
-        this.emit();
-        return;
-      }
-      if (!this.signaling.isOpen) {
-        this.fail('network', 'Couldn’t reach the signaling server that introduces you to the sender. Try again soon.');
-        return;
-      }
-      this.fail(
-        'unreachable',
-        "Couldn't connect to the sender directly. One of you may be behind a strict firewall or NAT; the site operator can fix this by adding a TURN server.",
+  /**
+   * Start a (re)connection. It ends when the sender's file list arrives over a fresh data channel, or with an error
+   * (see {@link tick}): never open-ended.
+   */
+  private beginConnect(rejoining: boolean): void {
+    this.connecting = true;
+    this.rejoining = rejoining;
+    this.episodeMs = 0;
+    this.attempts = 1;
+    this.attempt = randomId(6);
+    this.phase = this.signaling?.isOpen ? 'looking' : 'signaling';
+    this.phaseMs = 0;
+    clearInterval(this.ticker);
+    this.ticker = setInterval(() => this.tick(), 1000);
+  }
+
+  private endConnect(): void {
+    this.connecting = false;
+    clearInterval(this.ticker);
+    this.ticker = undefined;
+  }
+
+  private setPhase(phase: ConnectPhase): void {
+    if (this.phase === phase) return;
+    this.phase = phase;
+    this.phaseMs = 0;
+    this.emit();
+  }
+
+  /**
+   * Ask the sender for a connection. Repeating it is safe: the same `attempt` never makes the sender start over,
+   * it only resends its offer.
+   */
+  private sendJoin(): void {
+    if (this.isFinal) return;
+    this.lastJoinAt = Date.now();
+    this.signaling.send({ t: 'join', code: this.code, clientId: this.clientId, attempt: this.attempt });
+  }
+
+  /** Ask again if the last join (or the offer it asked for) may have been lost on the way. */
+  private rejoinIfDue(): void {
+    if (!this.signaling.reliable && Date.now() - this.lastJoinAt >= JOIN_RETRY_MS) this.sendJoin();
+  }
+
+  /** Once a second while connecting: move on, repeat, retry or give up. */
+  private tick(): void {
+    if (!this.connecting || this.isFinal) return this.endConnect();
+    if (document.visibilityState === 'hidden') return; // timers are throttled and nothing can happen anyway
+    this.episodeMs += 1000;
+    this.phaseMs += 1000;
+    switch (this.phase) {
+      case 'signaling':
+        if (this.signaling.isOpen) {
+          this.setPhase('looking');
+          this.rejoinIfDue();
+        } else if (this.phaseMs >= SIGNALING_TIMEOUT_MS) {
+          return this.giveUp(
+            'network',
+            'Couldn’t reach the signaling servers that introduce you to the sender. Check your internet connection, then try again.',
+          );
+        }
+        break;
+      case 'looking':
+        if (!this.signaling.isOpen) {
+          this.setPhase('signaling');
+        } else if (this.phaseMs >= (this.rejoining ? RELOOKING_TIMEOUT_MS : LOOKING_TIMEOUT_MS)) {
+          return this.rejoining && this.batch
+            ? this.giveUp(
+                'host-left',
+                'Lost the sender: their tab was closed or went offline before the transfer finished.',
+              )
+            : this.giveUp(
+                'no-sender',
+                'The link may have expired, or the sender’s PizzaDrop tab was closed or has gone to sleep (phones pause background tabs). Ask them to keep it open on screen, then try again.',
+              );
+        } else {
+          this.rejoinIfDue();
+        }
+        break;
+      case 'negotiating':
+        if (this.phaseMs >= NEGOTIATE_TIMEOUT_MS) this.retryConnection('the direct connection didn’t open in time');
+        // No offer yet: the sender resends it when asked again with the same attempt.
+        else if (!this.link && !this.linkPending) this.rejoinIfDue();
+        break;
+    }
+    if (this.connecting && this.episodeMs >= CONNECT_BUDGET_MS * (this.rejoining ? 2 : 1)) {
+      this.giveUp(
+        this.phase === 'negotiating' ? 'unreachable' : 'network',
+        this.phase === 'negotiating' ? UNREACHABLE : 'Couldn’t connect to the sender. Try again in a moment.',
       );
-    }, CONNECT_TIMEOUT_MS);
+    }
+  }
+
+  /** The peer connection failed or never opened: try once more with a fresh one, then give up. */
+  private retryConnection(reason: string): void {
+    if (this.attempts >= (this.rejoining ? MAX_RECONNECT_ATTEMPTS : MAX_CONNECT_ATTEMPTS)) {
+      return this.giveUp('unreachable', UNREACHABLE);
+    }
+    this.attempts++;
+    this.attempt = randomId(6);
+    console.warn(`[receiver] ${reason}; trying a fresh connection (attempt ${this.attempts})`);
+    this.closeLink();
+    this.phase = this.signaling.isOpen ? 'looking' : 'signaling';
+    this.phaseMs = 0;
+    this.sendJoin();
+    this.emit();
+  }
+
+  private giveUp(kind: ReceiveErrorKind, message: string): void {
+    this.endConnect();
+    if (this.status === 'done') return this.senderGone(); // everything asked for already arrived
+    this.fail(kind, message);
   }
 
   private onSignal(msg: ServerMessage): void {
     if (this.isFinal) return;
     switch (msg.t) {
       case 'signal':
-        if (msg.data.kind === 'description' && msg.data.description.type === 'offer') {
-          // A fresh offer means a fresh connection (first contact, or the sender re-offering).
-          this.closeLink();
-          this.link = new PeerLink(this.signaling.iceServers, (data) => this.signaling.send({ t: 'signal', data }));
-          this.link.pc.ondatachannel = (ev) => this.setupChannel(ev.channel);
-          this.link.pc.onconnectionstatechange = () => {
-            if (this.link?.pc.connectionState === 'failed') this.onConnectionLost();
-          };
-        }
-        void this.link?.handleSignal(msg.data).catch((err: unknown) => console.warn('[receiver] signal error', err));
+        this.onRemoteSignal(msg.data);
+        return;
+      case 'joined':
+        // The sender (or the server, for it) knows we're here: an offer is on its way.
+        if (this.connecting && this.phase !== 'negotiating') this.setPhase('negotiating');
         return;
       case 'error':
         if (msg.code === 'not-found') {
@@ -347,8 +480,46 @@ export class Receiver {
     }
   }
 
+  private onRemoteSignal(data: SignalPayload): void {
+    if (data.kind === 'description' && data.description.type === 'offer') {
+      if (data.conn !== undefined && (this.link?.conn === data.conn || this.linkPending === data.conn)) {
+        // The sender resent the offer we're answering: our answer may have been lost, so send it again.
+        this.link?.resendDescription();
+        return;
+      }
+      // A fresh offer means a fresh connection (first contact, or the sender re-offering).
+      this.closeLink();
+      const conn = data.conn ?? randomId(6);
+      this.linkPending = conn;
+      if (this.connecting) this.setPhase('negotiating');
+      void this.signaling.iceReady.then(() => {
+        if (this.isFinal || this.linkPending !== conn) return;
+        this.linkPending = null;
+        const link = new PeerLink(this.signaling.iceServers, conn, (d) =>
+          this.signaling.send({ t: 'signal', data: d }),
+        );
+        this.link = link;
+        link.pc.ondatachannel = (ev) => this.setupChannel(ev.channel);
+        link.pc.onconnectionstatechange = () => {
+          if (this.link === link && link.pc.connectionState === 'failed') this.onConnectionLost();
+        };
+        const early = this.early.filter((e) => e.conn === conn);
+        this.early = [];
+        for (const d of [data, ...early]) {
+          void link.handleSignal(d).catch((err: unknown) => console.warn('[receiver] signal error', err));
+        }
+      });
+      return;
+    }
+    if (this.link?.owns(data)) {
+      void this.link.handleSignal(data).catch((err: unknown) => console.warn('[receiver] signal error', err));
+    } else if (data.conn !== undefined && this.early.length < 64) {
+      this.early.push(data);
+    }
+  }
+
   private senderGone(): void {
-    clearTimeout(this.connectTimer);
+    this.endConnect();
     this.hostGone = true;
     this.emit();
   }
@@ -362,9 +533,6 @@ export class Receiver {
     this.lastAck = 0;
     this.block = null;
     this.awaitingManifest = true;
-    dc.onopen = () => {
-      clearTimeout(this.connectTimer);
-    };
     dc.onmessage = (ev: MessageEvent) => {
       if (this.isFinal) return;
       if (typeof ev.data === 'string') {
@@ -382,6 +550,8 @@ export class Receiver {
 
   private onConnectionLost(): void {
     if (this.isFinal) return;
+    // Still setting the connection up: that attempt failed, so make a fresh one (or give up).
+    if (this.connecting) return this.retryConnection('the connection failed while opening');
     this.closeLink();
     if (this.status === 'finishing' || this.hostGone) return; // every byte is already here
     if (++this.reconnects > MAX_RECONNECTS) {
@@ -391,16 +561,14 @@ export class Receiver {
     }
     if (this.status === 'receiving') this.status = 'reconnecting';
     else if (this.status === 'ready') this.status = 'connecting';
+    this.beginConnect(true);
+    // A new attempt id: the sender replaces its side of the broken connection instead of resending its offer.
+    this.sendJoin();
     this.emit();
-    const delay = 500 * this.reconnects;
-    setTimeout(() => {
-      if (this.isFinal || this.isChannelOpen || this.hostGone) return;
-      if (this.signaling.isOpen) this.join();
-      // Otherwise the signaling client is reconnecting and will join in onReady.
-    }, delay);
   }
 
   private closeLink(): void {
+    this.linkPending = null;
     if (this.dc) {
       this.dc.onclose = null;
       this.dc.onmessage = null;
@@ -438,6 +606,8 @@ export class Receiver {
     const reconnected = this.awaitingManifest;
     this.awaitingManifest = false;
     if (reconnected) {
+      // Connected: the file list arriving is what proves the new channel works end to end.
+      this.endConnect();
       this.reconnects = 0;
       if (this.status === 'connecting') this.status = 'ready';
       if (this.busy && this.batch) {
@@ -732,9 +902,9 @@ export class Receiver {
   private fail(kind: ReceiveErrorKind, message: string): void {
     if (this.isFinal) return;
     clearInterval(this.watchdog);
+    this.endConnect();
     this.status = 'error';
     this.error = { kind, message };
-    clearTimeout(this.connectTimer);
     const reason = new Error(message);
     this.batch?.incoming.forEach((f) => f.fail(reason));
     this.emit();
@@ -776,6 +946,7 @@ export class Receiver {
       sinkKind: this.sinkKind,
       repaired: this.repaired,
       hostGone: this.hostGone,
+      connect: this.connecting ? { phase: this.phase, attempt: this.attempts } : null,
       error: this.error,
     });
   }

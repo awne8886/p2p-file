@@ -7,7 +7,8 @@
  * drives headless Chromium through every receive path. A second part builds
  * the static client (`--mode static`) under a GitHub Pages–style base path,
  * serves it the way GitHub Pages does (404.html fallback) and runs transfers
- * through a local PeerJS server. Set CHROMIUM_PATH to use a specific browser
+ * through a local PeerJS server and a local Nostr relay, including with either
+ * of them broken. Set CHROMIUM_PATH to use a specific browser
  * binary; E2E_BIG_MB to change the large-file size; E2E_ONLY to run only the
  * tests whose name contains that text.
  */
@@ -32,6 +33,7 @@ import { fileURLToPath } from 'node:url';
 import { chromium, type Browser, type BrowserContextOptions, type Page } from 'playwright-core';
 import { PeerServer } from 'peer';
 import { PNG } from 'pngjs';
+import { startNostrRelay, startPeerJsProxy } from './relays.js';
 
 // jsqr is CommonJS whose module.exports is the function itself.
 const jsQR = createRequire(import.meta.url)('jsqr') as typeof JsQR.default;
@@ -54,6 +56,8 @@ type Sink = 'memory' | 'service-worker' | 'opfs' | 'file-system-access';
 /** Test-only globals installed with addInitScript. */
 type TestWindow = Window & {
   __channels: RTCDataChannel[];
+  /** Every status the receive card has shown, in order. */
+  __statuses: string[];
   showSaveFilePicker: (opts: { suggestedName: string }) => Promise<FileSystemFileHandle>;
 };
 
@@ -135,6 +139,15 @@ function sha256File(p: string): string {
 
 async function newPage(opts: BrowserContextOptions = {}): Promise<Page> {
   const context = await browser!.newContext({ viewport: { width: 1440, height: 900 }, acceptDownloads: true, ...opts });
+  // Record every status the receive card goes through: some (a local reconnect) last only a few milliseconds.
+  await context.addInitScript(() => {
+    const w = window as unknown as TestWindow;
+    w.__statuses = [];
+    new MutationObserver(() => {
+      const s = document.querySelector('[data-testid=receive-card]')?.getAttribute('data-status');
+      if (s && s !== w.__statuses.at(-1)) w.__statuses.push(s);
+    }).observe(document, { subtree: true, childList: true, attributes: true, attributeFilter: ['data-status'] });
+  });
   const page = await context.newPage();
   page.on('pageerror', (e) => console.log(`  [pageerror] ${e.message}`));
   page.on('console', (m) => {
@@ -206,6 +219,14 @@ async function corruptSends(page: Page, which: 'fifth' | 'all'): Promise<void> {
       send.call(this, out as ArrayBufferView<ArrayBuffer>);
     } as typeof send;
   }, which);
+}
+
+/** Wait until the receive card has shown `status` at some point since the page loaded. */
+async function sawStatus(page: Page, status: string, timeout: number): Promise<void> {
+  await page.waitForFunction((s) => (window as unknown as TestWindow).__statuses.includes(s), status, {
+    timeout,
+    polling: 50,
+  });
 }
 
 async function test(name: string, fn: () => Promise<void>): Promise<void> {
@@ -368,7 +389,7 @@ async function main(): Promise<void> {
     const { url } = await host([medium], { page: sender });
     const { page, file } = await receive(url, 'service-worker', {
       beforeDone: async (p) => {
-        await p.waitForSelector('[data-testid=receive-card][data-status=reconnecting]', { timeout: 40_000 });
+        await sawStatus(p, 'reconnecting', 40_000);
       },
     });
     assert(file && sha256File(file) === sha256File(medium), 'resumed download differs from the original');
@@ -457,7 +478,7 @@ async function main(): Promise<void> {
           { timeout: 120_000, polling: 20 },
         );
         await p.evaluate(() => (window as unknown as TestWindow).__channels.at(-1)?.close());
-        await p.waitForSelector('[data-testid=receive-card][data-status=reconnecting]', { timeout: 10_000 });
+        await sawStatus(p, 'reconnecting', 10_000);
         sawReconnect = true;
       },
     });
@@ -574,10 +595,12 @@ async function main(): Promise<void> {
   // ─── Static hosting: the GitHub Pages / Cloudflare Pages build ─────────────
 
   const peer = await startPeerServer();
-  const pages = await servePages(buildStatic(peer.port), PAGES_BASE);
+  const peerjs = await startPeerJsProxy(peer.port);
+  const nostr = await startNostrRelay();
+  const pages = await servePages(buildStatic(peerjs.port, nostr.url), PAGES_BASE);
   const onPages = `${pages.origin}${PAGES_BASE}`;
 
-  await test('static build under /p2p-file/ with PeerJS signaling: link, 404 fallback, service-worker download', async () => {
+  await test('static build under /p2p-file/ with relay signaling: link, 404 fallback, service-worker download', async () => {
     const { page: sender, url } = await host([small], { at: onPages });
     assert(new RegExp(`^${onPages}[23456789a-hjkmnp-z]{6}$`).test(url), `unexpected link ${url}`);
     const { page, file } = await receive(url, 'service-worker');
@@ -588,7 +611,7 @@ async function main(): Promise<void> {
     await sender.context().close();
   });
 
-  await test('static build: a dropped connection resumes through PeerJS signaling', async () => {
+  await test('static build: a dropped connection resumes through relay signaling', async () => {
     const { page: sender, url } = await host([big], { at: onPages });
     const page = await newPage();
     await page.addInitScript(() => {
@@ -611,7 +634,7 @@ async function main(): Promise<void> {
           { timeout: 120_000, polling: 20 },
         );
         await p.evaluate(() => (window as unknown as TestWindow).__channels.at(-1)?.close());
-        await p.waitForSelector('[data-testid=receive-card][data-status=reconnecting]', { timeout: 10_000 });
+        await sawStatus(p, 'reconnecting', 10_000);
       },
     });
     assert(file && sha256File(file) === bigHash, 'resumed download differs from the original');
@@ -619,15 +642,62 @@ async function main(): Promise<void> {
     await sender.context().close();
   });
 
-  await test('static build: a link nobody is sharing expires', async () => {
+  await test('static build: a link nobody is sharing says so', async () => {
     const page = await newPage();
     const res = await page.goto(`${onPages}zzzzzz`);
     assert(res?.status() === 404, 'GitHub Pages serves deep links from 404.html with a 404 status');
-    await page.waitForSelector('[data-testid=receive-error][data-kind=not-found]', { timeout: 20_000 });
+    await page.waitForSelector('[data-testid=receive-error][data-kind=no-sender]', { timeout: 25_000 });
     await page.context().close();
   });
 
+  await test('static build: PeerJS drops every connection that relays a message; Nostr carries the transfer', async () => {
+    peerjs.setHostile(true);
+    try {
+      const { page: sender, url } = await host([small], { at: onPages });
+      const t0 = Date.now();
+      const { page, file } = await receive(url, 'service-worker');
+      assert(file && sha256File(file) === smallHash, 'downloaded bytes differ from the original');
+      console.log(`    received in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
+      await page.context().close();
+      await sender.context().close();
+    } finally {
+      peerjs.setHostile(false);
+    }
+  });
+
+  await test('static build: with the Nostr relays down, PeerJS alone carries the transfer', async () => {
+    nostr.setDown(true);
+    try {
+      const { page: sender, url } = await host([small], { at: onPages });
+      const { page, file } = await receive(url, 'memory');
+      assert(file && sha256File(file) === smallHash, 'downloaded bytes differ from the original');
+      await page.context().close();
+      await sender.context().close();
+    } finally {
+      nostr.setDown(false);
+    }
+  });
+
+  await test('static build: when no relay works, the receiver says so instead of spinning forever', async () => {
+    peerjs.setHostile(true);
+    nostr.setDown(true);
+    try {
+      const page = await newPage();
+      const t0 = Date.now();
+      await page.goto(`${onPages}x7k4qm`);
+      await page.waitForSelector('[data-testid=receive-error][data-kind=network]', { timeout: 40_000 });
+      const secs = (Date.now() - t0) / 1000;
+      console.log(`    gave up after ${secs.toFixed(1)} s`);
+      await page.context().close();
+    } finally {
+      peerjs.setHostile(false);
+      nostr.setDown(false);
+    }
+  });
+
   pages.close();
+  peerjs.close();
+  nostr.close();
   peer.close();
 }
 
@@ -645,8 +715,8 @@ async function startPeerServer(): Promise<{ port: number; close(): void }> {
   });
 }
 
-/** `npm run build:static` as the GitHub Pages workflow runs it, pointed at the local PeerJS server. */
-function buildStatic(peerPort: number): string {
+/** `npm run build:static` as the GitHub Pages workflow runs it, pointed at the local relays. */
+function buildStatic(peerPort: number, nostrUrl: string): string {
   const outDir = path.join(OUT, 'pages-site');
   execFileSync(process.execPath, [path.join(ROOT, 'node_modules/vite/bin/vite.js'), 'build', '--mode', 'static'], {
     cwd: path.join(ROOT, 'client'),
@@ -655,6 +725,7 @@ function buildStatic(peerPort: number): string {
       BASE_PATH: PAGES_BASE,
       OUT_DIR: outDir,
       VITE_PEERJS_URL: `ws://127.0.0.1:${peerPort}/peerjs`,
+      VITE_NOSTR_RELAYS: nostrUrl,
     },
     stdio: ['ignore', 'ignore', 'inherit'],
   });

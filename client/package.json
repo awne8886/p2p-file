@@ -12,6 +12,7 @@
     "build:static": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.worker.json --noEmit && vite build --mode static"
   },
   "dependencies": {
+    "@noble/curves": "^2.4.0",
     "@noble/hashes": "^2.4.0",
     "client-zip": "^2.5.1",
     "qrcode-generator": "^2.0.4",
