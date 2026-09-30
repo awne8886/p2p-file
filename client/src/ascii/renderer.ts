@@ -44,7 +44,7 @@ const SUB_X = 4;
 const SUB_Y = 6;
 const TAU = Math.PI * 2;
 /** The whole pizza turns clockwise once every this many seconds. */
-const SPIN_PERIOD_S = 90;
+const SPIN_PERIOD_S = 60;
 /** Texels across the whole pizza's material map. */
 const MAP_SIZE = 320;
 /** Material-map texel outside the pizza. */
